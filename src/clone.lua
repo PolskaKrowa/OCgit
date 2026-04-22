@@ -1,4 +1,4 @@
--- gitlite.lua - A minimal git clone implementation for OpenOS
+-- clone.lua - A minimal git clone implementation for OpenOS
 
 local component = require("component")
 local filesystem = require("filesystem")
