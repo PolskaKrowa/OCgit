@@ -1,599 +1,622 @@
--- gitlite.lua
--- Minimal dumb-HTTP Git client for OpenComputers/OpenOS
--- Supports:
---   gitlite clone <url> [dir]
---   gitlite pull <dir>
---   gitlite sync <url> [dir]
---
--- Notes:
---   * Requires a Data Card for component.data.inflate()
---   * Works only with "dumb" HTTP Git repositories
---   * Does not support packfiles, smart HTTP, SSH, merges, rebase, or tags
+-- gitlite.lua - A minimal git clone implementation for OpenOS
 
-local fs = require("filesystem")
-local internet = require("internet")
 local component = require("component")
+local filesystem = require("filesystem")
+local internet   = require("internet")
+local data_comp  = component.data
 
-local data = component.isAvailable("data") and component.data or nil
-if not data then
-  io.stderr:write("This script requires a Data Card for inflate support.\n")
-  io.stderr:write("Install a Data Card, then try again.\n")
-  os.exit(1)
-end
-
-local function trim(s)
-  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
-local function trim_slashes(s)
-  return (s:gsub("/+$", ""))
-end
-
-local function join_url(base, path)
-  base = trim_slashes(base)
-  path = tostring(path or ""):gsub("^/+", "")
-  return base .. "/" .. path
-end
-
-local function hex_to_bin(hex)
-  hex = hex:gsub("%s+", ""):lower()
-  return (hex:gsub("..", function(cc)
-    return string.char(tonumber(cc, 16))
-  end))
-end
-
-local function bin_to_hex(bin)
-  return (bin:gsub(".", function(c)
-    return string.format("%02x", string.byte(c))
-  end))
-end
-
-local function read_file(path)
-  local f = io.open(path, "rb")
-  if not f then return nil end
-  local s = f:read("*a")
-  f:close()
-  return s
-end
-
-local function write_file(path, content)
-  local parent = path:match("^(.*)/[^/]+$")
-  if parent and parent ~= "" and not fs.exists(parent) then
-    fs.makeDirectory(parent)
+--------------------------------------------------------------------------------
+-- Pure-Lua SHA-1
+--------------------------------------------------------------------------------
+local function sha1(msg)
+  local function rotate(x, n)
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
   end
-  local f, err = io.open(path, "wb")
-  if not f then
-    return nil, err
+
+  local h0 = 0x67452301
+  local h1 = 0xEFCDAB89
+  local h2 = 0x98BADCFE
+  local h3 = 0x10325476
+  local h4 = 0xC3D2E1F0
+
+  -- Padding
+  local msg_len = #msg
+  msg = msg .. "\128"
+  while #msg % 64 ~= 56 do msg = msg .. "\0" end
+
+  -- Append original bit-length as 64-bit big-endian
+  local bit_len = msg_len * 8
+  msg = msg .. string.char(
+    (bit_len >> 56) & 0xFF, (bit_len >> 48) & 0xFF,
+    (bit_len >> 40) & 0xFF, (bit_len >> 32) & 0xFF,
+    (bit_len >> 24) & 0xFF, (bit_len >> 16) & 0xFF,
+    (bit_len >>  8) & 0xFF,  bit_len        & 0xFF
+  )
+
+  for i = 1, #msg, 64 do
+    local chunk = msg:sub(i, i + 63)
+    local w = {}
+    for j = 0, 15 do
+      local b1, b2, b3, b4 = chunk:byte(j*4+1, j*4+4)
+      w[j] = ((b1 << 24) | (b2 << 16) | (b3 << 8) | b4) & 0xFFFFFFFF
+    end
+    for j = 16, 79 do
+      w[j] = rotate(w[j-3] ~ w[j-8] ~ w[j-14] ~ w[j-16], 1)
+    end
+
+    local a, b, c, d, e = h0, h1, h2, h3, h4
+    for j = 0, 79 do
+      local f, k
+      if j < 20 then
+        f = ((b & c) | ((~b) & d)) & 0xFFFFFFFF; k = 0x5A827999
+      elseif j < 40 then
+        f = (b ~ c ~ d)            & 0xFFFFFFFF; k = 0x6ED9EBA1
+      elseif j < 60 then
+        f = ((b & c) | (b & d) | (c & d)) & 0xFFFFFFFF; k = 0x8F1BBCDC
+      else
+        f = (b ~ c ~ d)            & 0xFFFFFFFF; k = 0xCA62C1D6
+      end
+      local temp = (rotate(a, 5) + f + e + k + w[j]) & 0xFFFFFFFF
+      e = d; d = c; c = rotate(b, 30); b = a; a = temp
+    end
+
+    h0 = (h0 + a) & 0xFFFFFFFF; h1 = (h1 + b) & 0xFFFFFFFF
+    h2 = (h2 + c) & 0xFFFFFFFF; h3 = (h3 + d) & 0xFFFFFFFF
+    h4 = (h4 + e) & 0xFFFFFFFF
   end
-  f:write(content)
-  f:close()
-  return true
+
+  return string.format("%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4)
 end
 
-local function mkdir_p(path)
-  if not path or path == "" then return true end
-  if fs.exists(path) then return true end
-  local parent = path:match("^(.*)/[^/]+$")
-  if parent and parent ~= "" and not fs.exists(parent) then
-    local ok, err = mkdir_p(parent)
-    if not ok then return nil, err end
-  end
-  if not fs.exists(path) then
-    local ok, err = pcall(fs.makeDirectory, path)
-    if not ok then
-      return nil, err
+--------------------------------------------------------------------------------
+-- Utility: read a big-endian u32 from a string at position pos
+--------------------------------------------------------------------------------
+local function read_u32_be(data, pos)
+  local b1, b2, b3, b4 = data:byte(pos, pos + 3)
+  return ((b1 << 24) | (b2 << 16) | (b3 << 8) | b4) & 0xFFFFFFFF
+end
+
+--------------------------------------------------------------------------------
+-- Utility to format a string into a pkt-line
+--------------------------------------------------------------------------------
+local function pkt_line(text)
+  if text == "FLUSH"        then return "0000" end
+  if text == "DELIM"        then return "0001" end
+  if text == "RESPONSE_END" then return "0002" end
+  local len = #text + 4
+  return string.format("%04x%s", len, text)
+end
+
+--------------------------------------------------------------------------------
+-- Utility to parse a stream of pkt-lines
+--------------------------------------------------------------------------------
+local function parse_pkt_lines(raw_data)
+  local lines = {}
+  local pos = 1
+  while pos <= #raw_data do
+    local hex_len = raw_data:sub(pos, pos + 3)
+    if #hex_len < 4 then break end
+    local len = tonumber(hex_len, 16)
+    if not len then break end
+
+    if len == 0 then
+      lines[#lines + 1] = "FLUSH";        pos = pos + 4
+    elseif len == 1 then
+      lines[#lines + 1] = "DELIM";        pos = pos + 4
+    elseif len == 2 then
+      lines[#lines + 1] = "RESPONSE_END"; pos = pos + 4
+    else
+      lines[#lines + 1] = raw_data:sub(pos + 4, pos + len - 1)
+      pos = pos + len
     end
   end
-  return true
+  return lines
 end
 
-local function remove_tree(path)
-  if not fs.exists(path) then return true end
-  if fs.isDirectory(path) then
-    for name in fs.list(path) do
-      if name ~= "." and name ~= ".." then
-        local child = path .. "/" .. name
-        remove_tree(child)
+--------------------------------------------------------------------------------
+-- HTTP helper
+--------------------------------------------------------------------------------
+local function http_request(url, post_data, headers)
+  local req = internet.request(url, post_data, headers)
+  local chunks = {}
+  for chunk in req do chunks[#chunks + 1] = chunk end
+  return table.concat(chunks)
+end
+
+--------------------------------------------------------------------------------
+-- Step 1: Discover available refs (ls-refs)
+--------------------------------------------------------------------------------
+local function discover_refs(remote_url)
+  local url     = remote_url .. "/info/refs?service=git-upload-pack"
+  local headers = { ["Git-Protocol"] = "version=2" }
+
+  print("Discovering refs via Protocol v2...")
+  local response = http_request(url, nil, headers)
+  local lines    = parse_pkt_lines(response)
+  local refs     = {}
+
+  for _, line in ipairs(lines) do
+    local sha, ref = line:match("^([0-9a-f]+)%s+(refs/heads/%S+)")
+    if sha and ref then refs[ref] = sha end
+  end
+  return refs
+end
+
+--------------------------------------------------------------------------------
+-- Step 2: Request the Packfile (fetch)
+--------------------------------------------------------------------------------
+local function negotiate_packfile(remote_url, want_sha)
+  local url = remote_url .. "/git-upload-pack"
+  local headers = {
+    ["Git-Protocol"]  = "version=2",
+    ["Content-Type"]  = "application/x-git-upload-pack-request",
+    ["Accept"]        = "application/x-git-upload-pack-result",
+  }
+
+  local payload = table.concat({
+    pkt_line("command=fetch\n"),
+    pkt_line("DELIM"),
+    pkt_line("thin-pack\n"),
+    pkt_line("ofs-delta\n"),
+    pkt_line("want " .. want_sha .. "\n"),
+    pkt_line("done\n"),
+    pkt_line("FLUSH"),
+  })
+
+  print("Requesting packfile for " .. want_sha .. "...")
+  return http_request(url, payload, headers)
+end
+
+--------------------------------------------------------------------------------
+-- Step 3: Demultiplex the Sideband
+--
+-- Every pkt-line payload begins with a channel byte:
+--   \1  Packfile binary data  → collect into a buffer
+--   \2  Progress message      → print to console
+--   \3  Fatal error           → raise an error
+--------------------------------------------------------------------------------
+local function demux_sideband(response)
+  local lines  = parse_pkt_lines(response)
+  local chunks = {}
+
+  for _, line in ipairs(lines) do
+    if line ~= "FLUSH" and line ~= "DELIM" and line ~= "RESPONSE_END" then
+      local channel = line:byte(1)
+      local payload = line:sub(2)
+
+      if channel == 1 then
+        chunks[#chunks + 1] = payload          -- packfile data
+      elseif channel == 2 then
+        io.write(payload)                       -- progress (e.g. "Compressing…")
+      elseif channel == 3 then
+        error("Remote error: " .. payload)
       end
     end
   end
-  if path ~= "." then
-    pcall(fs.remove, path)
-  end
-  return true
+
+  return table.concat(chunks)
 end
 
-local function clean_worktree(root)
-  if not fs.exists(root) then return true end
-  for name in fs.list(root) do
-    if name ~= ".git" and name ~= "." and name ~= ".." then
-      remove_tree(root .. "/" .. name)
-    end
-  end
-end
+--------------------------------------------------------------------------------
+-- inflate helper: binary-search for the minimum byte count that produces a
+-- complete zlib stream of the expected decompressed size, then return both the
+-- decompressed data and the new stream position.
+--
+-- component.data.inflate() is self-delimiting (it ignores trailing bytes), so
+-- this lets us consume exactly the right number of bytes per object.
+--------------------------------------------------------------------------------
+local function inflate_at(data, pos, expected_size)
+  local avail = #data - pos + 1
+  local lo, hi = 2, avail
+  local consumed = avail
+  local result
 
-local function http_get(url)
-  local req = internet.request(url)
-  if not req then
-    return nil, nil, nil, "request failed"
-  end
+  -- Get the actual content using the full remaining buffer first
+  result = data_comp.inflate(data:sub(pos))
 
-  local chunks = {}
-  for chunk in req do
-    chunks[#chunks + 1] = chunk
-  end
-  local body = table.concat(chunks)
-
-  local mt = getmetatable(req)
-  local code, message, headers = nil, nil, nil
-  if mt and mt.__index and mt.__index.response then
-    code, message, headers = mt.__index.response()
-  end
-  return body, code, message, headers
-end
-
-local function is_smart_http_response(body, headers)
-  if not body then return false end
-  if body:sub(1, 8) == "001e# se" then
-    return true
-  end
-  if body:find("service=git%-upload%-pack", 1, true) then
-    return true
-  end
-  if headers then
-    local ct = headers["Content-Type"] or headers["content-type"]
-    if ct and tostring(ct):find("application/x%-git%-upload%-pack") then
-      return true
-    end
-  end
-  return false
-end
-
-local function parse_refs_list(body)
-  local refs = {}
-  for line in body:gmatch("[^\r\n]+") do
-    local sha, ref = line:match("^([0-9a-fA-F]+)%s+(.+)$")
-    if sha and ref then
-      refs[ref] = sha:lower()
-    end
-  end
-  return refs
-end
-
-local function fetch_remote_head(remote_url)
-  local body, code, _, _ = http_get(join_url(remote_url, "HEAD"))
-  if code ~= 200 or not body then
-    return nil
-  end
-  local ref = body:match("^ref:%s*(%S+)")
-  return ref
-end
-
-local function fetch_remote_refs(remote_url)
-  local body, code, _, headers = http_get(join_url(remote_url, "info/refs"))
-  if not body or (code and code ~= 200 and code ~= 304) then
-    return nil, "failed to fetch info/refs"
-  end
-
-  if is_smart_http_response(body, headers) then
-    return nil, "remote uses smart HTTP or pkt-line refs; this script only supports dumb HTTP"
-  end
-
-  local refs = parse_refs_list(body)
-  return refs
-end
-
-local function choose_branch_ref(remote_url, refs)
-  local head_ref = fetch_remote_head(remote_url)
-  if head_ref and refs[head_ref] then
-    return head_ref, refs[head_ref]
-  end
-
-  if refs["refs/heads/main"] then
-    return "refs/heads/main", refs["refs/heads/main"]
-  end
-
-  if refs["refs/heads/master"] then
-    return "refs/heads/master", refs["refs/heads/master"]
-  end
-
-  for ref, sha in pairs(refs) do
-    if ref:match("^refs/heads/") then
-      return ref, sha
+  -- Binary-search for the minimum prefix that still inflates to expected_size
+  while lo <= hi do
+    local mid = math.floor((lo + hi) / 2)
+    local ok, res = pcall(data_comp.inflate, data:sub(pos, pos + mid - 1))
+    if ok and res and #res == expected_size then
+      consumed = mid
+      hi = mid - 1
+    else
+      lo = mid + 1
     end
   end
 
-  return nil, nil
+  return result, pos + consumed
 end
 
-local function object_path(repo_dir, sha)
-  return repo_dir .. "/.git/objects/" .. sha:sub(1, 2) .. "/" .. sha:sub(3)
+--------------------------------------------------------------------------------
+-- Write a loose object to .git/objects/xx/yyyy…
+--------------------------------------------------------------------------------
+local function write_object(git_dir, sha, type_name, content)
+  local obj_dir  = git_dir .. "/objects/" .. sha:sub(1, 2)
+  local obj_path = obj_dir .. "/" .. sha:sub(3)
+
+  if filesystem.exists(obj_path) then return end   -- already stored
+
+  if not filesystem.isDirectory(obj_dir) then
+    filesystem.makeDirectory(obj_dir)
+  end
+
+  local store      = type_name .. " " .. #content .. "\0" .. content
+  local compressed = data_comp.deflate(store)
+
+  local f = io.open(obj_path, "wb")
+  f:write(compressed)
+  f:close()
 end
 
-local function loose_object_exists(repo_dir, sha)
-  return fs.exists(object_path(repo_dir, sha))
-end
+--------------------------------------------------------------------------------
+-- Step 4a: Apply a binary delta (both OFS_DELTA and REF_DELTA share the same
+-- delta-data format after the header has been stripped).
+--
+-- Delta format:
+--   [source size varint] [target size varint]
+--   Then a sequence of commands:
+--     bit7=1  COPY   – copy a region from the base object
+--     bit7=0  INSERT – copy N literal bytes from the delta stream
+--------------------------------------------------------------------------------
+local function apply_delta(base, delta)
+  local pos = 1
 
-local function fetch_loose_object(repo_dir, remote_url, sha)
-  local path = object_path(repo_dir, sha)
-  if fs.exists(path) then
-    return true
+  -- Read a variable-length integer (little-endian, MSB = continue)
+  local function read_varint()
+    local val, shift = 0, 0
+    repeat
+      local b = delta:byte(pos); pos = pos + 1
+      val = val | ((b & 0x7F) << shift)
+      shift = shift + 7
+      if b & 0x80 == 0 then break end
+    until false
+    return val
   end
 
-  local url = join_url(remote_url, "objects/" .. sha:sub(1, 2) .. "/" .. sha:sub(3))
-  local body, code = http_get(url)
-  if not body or code ~= 200 then
-    return nil, "missing loose object " .. sha
-  end
+  local src_size = read_varint()
+  local dst_size = read_varint()   -- used for sanity-checking below
 
-  local parent = path:match("^(.*)/[^/]+$")
-  if parent and not fs.exists(parent) then
-    local ok, err = mkdir_p(parent)
-    if not ok then
-      return nil, err
-    end
-  end
+  assert(#base == src_size,
+    string.format("Delta base size mismatch: expected %d, got %d", src_size, #base))
 
-  local ok, err = write_file(path, body)
-  if not ok then
-    return nil, err
-  end
-  return true
-end
+  local result = {}
 
-local function load_loose_object(repo_dir, sha)
-  local path = object_path(repo_dir, sha)
-  local raw = read_file(path)
-  if not raw then
-    return nil, "object not present locally: " .. sha
-  end
+  while pos <= #delta do
+    local cmd = delta:byte(pos); pos = pos + 1
 
-  local ok, inflated = pcall(data.inflate, raw)
-  if not ok then
-    return nil, "failed to inflate object " .. sha .. ": " .. tostring(inflated)
-  end
+    if cmd & 0x80 ~= 0 then
+      ------------------------------------------------------------------
+      -- COPY instruction
+      -- Bits 0-3 of cmd select which of the next 4 bytes carry the offset.
+      -- Bits 4-6 of cmd select which of the next 3 bytes carry the size.
+      ------------------------------------------------------------------
+      local copy_offset = 0
+      local copy_size   = 0
 
-  local nul = inflated:find("\0", 1, true)
-  if not nul then
-    return nil, "invalid loose object: " .. sha
-  end
+      if cmd & 0x01 ~= 0 then copy_offset = copy_offset | (delta:byte(pos) <<  0); pos = pos + 1 end
+      if cmd & 0x02 ~= 0 then copy_offset = copy_offset | (delta:byte(pos) <<  8); pos = pos + 1 end
+      if cmd & 0x04 ~= 0 then copy_offset = copy_offset | (delta:byte(pos) << 16); pos = pos + 1 end
+      if cmd & 0x08 ~= 0 then copy_offset = copy_offset | (delta:byte(pos) << 24); pos = pos + 1 end
 
-  local header = inflated:sub(1, nul - 1)
-  local obj_type, size = header:match("^(%S+)%s+(%d+)$")
-  if not obj_type then
-    return nil, "invalid loose object header: " .. sha
-  end
+      if cmd & 0x10 ~= 0 then copy_size   = copy_size   | (delta:byte(pos) <<  0); pos = pos + 1 end
+      if cmd & 0x20 ~= 0 then copy_size   = copy_size   | (delta:byte(pos) <<  8); pos = pos + 1 end
+      if cmd & 0x40 ~= 0 then copy_size   = copy_size   | (delta:byte(pos) << 16); pos = pos + 1 end
 
-  local content = inflated:sub(nul + 1)
-  if tonumber(size) ~= #content then
-    return nil, "size mismatch for object " .. sha
-  end
+      if copy_size == 0 then copy_size = 0x10000 end  -- size=0 means 65536
 
-  return {
-    type = obj_type,
-    size = tonumber(size),
-    content = content
-  }
-end
+      result[#result + 1] = base:sub(copy_offset + 1, copy_offset + copy_size)
 
-local function ensure_object(repo_dir, remote_url, sha, seen)
-  seen = seen or {}
-  sha = sha:lower()
-
-  if seen[sha] then
-    return true
-  end
-  seen[sha] = true
-
-  local ok, err = fetch_loose_object(repo_dir, remote_url, sha)
-  if not ok then
-    return nil, err
-  end
-
-  local obj, load_err = load_loose_object(repo_dir, sha)
-  if not obj then
-    return nil, load_err
-  end
-
-  if obj.type == "commit" then
-    local tree = obj.content:match("\ntree ([0-9a-f]+)")
-    if tree then
-      local ok2, err2 = ensure_object(repo_dir, remote_url, tree, seen)
-      if not ok2 then return nil, err2 end
-    end
-
-    for parent in obj.content:gmatch("\nparent ([0-9a-f]+)") do
-      local ok2, err2 = ensure_object(repo_dir, remote_url, parent, seen)
-      if not ok2 then return nil, err2 end
-    end
-
-  elseif obj.type == "tree" then
-    local i = 1
-    while i <= #obj.content do
-      local space = obj.content:find(" ", i, true)
-      if not space then break end
-      local nul = obj.content:find("\0", space + 1, true)
-      if not nul then break end
-
-      local mode = obj.content:sub(i, space - 1)
-      local sha_bin = obj.content:sub(nul + 1, nul + 20)
-      local entry_sha = bin_to_hex(sha_bin)
-
-      local ok2, err2 = ensure_object(repo_dir, remote_url, entry_sha, seen)
-      if not ok2 then return nil, err2 end
-
-      i = nul + 21
-    end
-  end
-
-  return true
-end
-
-local function parse_tree_entries(tree_content)
-  local entries = {}
-  local i = 1
-
-  while i <= #tree_content do
-    local space = tree_content:find(" ", i, true)
-    if not space then break end
-
-    local nul = tree_content:find("\0", space + 1, true)
-    if not nul then break end
-
-    local mode = tree_content:sub(i, space - 1)
-    local name = tree_content:sub(space + 1, nul - 1)
-    local sha_bin = tree_content:sub(nul + 1, nul + 20)
-    local sha = bin_to_hex(sha_bin)
-
-    entries[#entries + 1] = {
-      mode = mode,
-      name = name,
-      sha = sha
-    }
-
-    i = nul + 21
-  end
-
-  return entries
-end
-
-local function checkout_tree(repo_dir, remote_url, tree_sha, target_dir)
-  local tree_obj, err = load_loose_object(repo_dir, tree_sha)
-  if not tree_obj then
-    return nil, err
-  end
-  if tree_obj.type ~= "tree" then
-    return nil, "expected tree object, got " .. tree_obj.type
-  end
-
-  mkdir_p(target_dir)
-
-  for _, entry in ipairs(parse_tree_entries(tree_obj.content)) do
-    local out_path = target_dir .. "/" .. entry.name
-
-    if entry.mode == "040000" or entry.mode == "40000" or entry.mode == "400000" then
-      local ok, err2 = checkout_tree(repo_dir, remote_url, entry.sha, out_path)
-      if not ok then return nil, err2 end
-
-    elseif entry.mode == "160000" then
-      io.stderr:write("Skipping submodule entry: " .. out_path .. "\n")
+    elseif cmd ~= 0 then
+      ------------------------------------------------------------------
+      -- INSERT instruction: cmd = number of literal bytes to copy
+      ------------------------------------------------------------------
+      result[#result + 1] = delta:sub(pos, pos + cmd - 1)
+      pos = pos + cmd
 
     else
-      local blob_obj, blob_err = load_loose_object(repo_dir, entry.sha)
-      if not blob_obj then
-        return nil, blob_err
-      end
-      if blob_obj.type ~= "blob" then
-        return nil, "expected blob for " .. out_path .. ", got " .. blob_obj.type
-      end
-
-      local parent = out_path:match("^(.*)/[^/]+$")
-      if parent and parent ~= "" then
-        mkdir_p(parent)
-      end
-
-      local f, ferr = io.open(out_path, "wb")
-      if not f then
-        return nil, ferr
-      end
-      f:write(blob_obj.content)
-      f:close()
+      error("Unexpected delta command byte 0x00")
     end
   end
 
-  return true
+  local out = table.concat(result)
+  assert(#out == dst_size,
+    string.format("Delta output size mismatch: expected %d, got %d", dst_size, #out))
+  return out
 end
 
-local function checkout_commit(repo_dir, remote_url, commit_sha, target_dir)
-  local commit_obj, err = load_loose_object(repo_dir, commit_sha)
-  if not commit_obj then
-    return nil, err
-  end
-  if commit_obj.type ~= "commit" then
-    return nil, "expected commit object, got " .. commit_obj.type
+--------------------------------------------------------------------------------
+-- Step 4b: Parse the Packfile
+--
+-- Header layout:
+--   Bytes 1-4  : Magic "PACK"
+--   Bytes 5-8  : Version (big-endian u32, usually 2)
+--   Bytes 9-12 : Object count (big-endian u32)
+--
+-- Per-object layout:
+--   Variable-length type+size header (MSB = more bytes follow)
+--   For OFS_DELTA : variable-length negative offset (MSB-encoded)
+--   For REF_DELTA : 20 raw bytes (binary SHA-1 of base object)
+--   Followed by zlib-deflated object data
+--------------------------------------------------------------------------------
+local TYPE_NAMES = { [1]="commit", [2]="tree", [3]="blob", [4]="tag" }
+
+local function parse_packfile(pack_data, git_dir)
+  -- ── Header ────────────────────────────────────────────────────────────────
+  assert(pack_data:sub(1, 4) == "PACK", "Invalid packfile magic")
+  local version     = read_u32_be(pack_data, 5)
+  local num_objects = read_u32_be(pack_data, 9)
+  print(string.format("Packfile v%d – %d objects", version, num_objects))
+
+  local pos = 13  -- byte position in pack_data (1-indexed)
+
+  -- Tables to accumulate results
+  local objects    = {}   -- sha  -> { type=string, data=string }
+  local off_to_sha = {}   -- file_offset -> sha  (for OFS_DELTA resolution)
+  local ofs_queue  = {}   -- pending OFS_DELTA entries
+  local ref_queue  = {}   -- pending REF_DELTA entries
+
+  -- ── Object loop ───────────────────────────────────────────────────────────
+  for _ = 1, num_objects do
+    local obj_start = pos
+
+    -- Read the variable-length type+size header
+    local byte     = pack_data:byte(pos); pos = pos + 1
+    local obj_type = (byte >> 4) & 0x7
+    local size     = byte & 0xF
+    local shift    = 4
+
+    while byte & 0x80 ~= 0 do
+      byte  = pack_data:byte(pos); pos = pos + 1
+      size  = size | ((byte & 0x7F) << shift)
+      shift = shift + 7
+    end
+
+    if obj_type == 6 then
+      -- ── OFS_DELTA: base is at (obj_start - offset) ──────────────────────
+      -- The offset is encoded with a "bijective base-128" scheme
+      byte = pack_data:byte(pos); pos = pos + 1
+      local offset = byte & 0x7F
+      while byte & 0x80 ~= 0 do
+        byte   = pack_data:byte(pos); pos = pos + 1
+        offset = ((offset + 1) << 7) | (byte & 0x7F)
+      end
+
+      local delta_data, new_pos = inflate_at(pack_data, pos, size)
+      pos = new_pos
+
+      ofs_queue[#ofs_queue + 1] = {
+        obj_offset  = obj_start,
+        base_offset = obj_start - offset,
+        delta       = delta_data,
+      }
+
+    elseif obj_type == 7 then
+      -- ── REF_DELTA: base identified by its 20-byte binary SHA ─────────────
+      local base_sha = ""
+      for j = 0, 19 do
+        base_sha = base_sha .. string.format("%02x", pack_data:byte(pos + j))
+      end
+      pos = pos + 20
+
+      local delta_data, new_pos = inflate_at(pack_data, pos, size)
+      pos = new_pos
+
+      ref_queue[#ref_queue + 1] = {
+        obj_offset = obj_start,
+        base_sha   = base_sha,
+        delta      = delta_data,
+      }
+
+    else
+      -- ── Regular object (commit / tree / blob / tag) ──────────────────────
+      local type_name            = TYPE_NAMES[obj_type]
+      local content, new_pos     = inflate_at(pack_data, pos, size)
+      pos                        = new_pos
+
+      local store = type_name .. " " .. #content .. "\0" .. content
+      local sha   = sha1(store)
+
+      objects[sha]      = { type = type_name, data = content }
+      off_to_sha[obj_start] = sha
+
+      write_object(git_dir, sha, type_name, content)
+      print(string.format("  [%s] %s", type_name, sha))
+    end
   end
 
-  local tree_sha = commit_obj.content:match("\ntree ([0-9a-f]+)")
-  if not tree_sha then
-    return nil, "commit has no tree: " .. commit_sha
+  -- ── Delta resolution (multiple passes for chained deltas) ─────────────────
+  local function resolve_pass()
+    local resolved = 0
+
+    -- OFS_DELTA
+    local remaining_ofs = {}
+    for _, entry in ipairs(ofs_queue) do
+      local base_sha = off_to_sha[entry.base_offset]
+      local base_obj = base_sha and objects[base_sha]
+      if base_obj then
+        local content   = apply_delta(base_obj.data, entry.delta)
+        local type_name = base_obj.type
+        local store     = type_name .. " " .. #content .. "\0" .. content
+        local sha       = sha1(store)
+
+        objects[sha]               = { type = type_name, data = content }
+        off_to_sha[entry.obj_offset] = sha
+
+        write_object(git_dir, sha, type_name, content)
+        print(string.format("  [%s/ofs_delta] %s", type_name, sha))
+        resolved = resolved + 1
+      else
+        remaining_ofs[#remaining_ofs + 1] = entry
+      end
+    end
+    ofs_queue = remaining_ofs
+
+    -- REF_DELTA
+    local remaining_ref = {}
+    for _, entry in ipairs(ref_queue) do
+      local base_obj = objects[entry.base_sha]
+      if base_obj then
+        local content   = apply_delta(base_obj.data, entry.delta)
+        local type_name = base_obj.type
+        local store     = type_name .. " " .. #content .. "\0" .. content
+        local sha       = sha1(store)
+
+        objects[sha]               = { type = type_name, data = content }
+        off_to_sha[entry.obj_offset] = sha
+
+        write_object(git_dir, sha, type_name, content)
+        print(string.format("  [%s/ref_delta] %s", type_name, sha))
+        resolved = resolved + 1
+      else
+        remaining_ref[#remaining_ref + 1] = entry
+      end
+    end
+    ref_queue = remaining_ref
+
+    return resolved
   end
 
-  clean_worktree(target_dir)
-  local ok, err2 = checkout_tree(repo_dir, remote_url, tree_sha, target_dir)
-  if not ok then return nil, err2 end
+  -- Keep resolving until nothing left (handles chained deltas)
+  repeat until resolve_pass() == 0
 
-  return true, tree_sha
+  if #ofs_queue + #ref_queue > 0 then
+    print(string.format("WARNING: %d delta(s) could not be resolved (missing base objects)",
+      #ofs_queue + #ref_queue))
+  end
+
+  return objects
 end
 
-local function ensure_repo_layout(repo_dir)
-  mkdir_p(repo_dir)
-  mkdir_p(repo_dir .. "/.git")
-  mkdir_p(repo_dir .. "/.git/objects")
-  mkdir_p(repo_dir .. "/.git/refs")
-  mkdir_p(repo_dir .. "/.git/refs/heads")
+--------------------------------------------------------------------------------
+-- Checkout: walk tree objects and write blobs to the working directory
+--------------------------------------------------------------------------------
+local function checkout(git_dir, work_dir, tree_sha, objects)
+  local tree_obj = objects[tree_sha]
+  if not tree_obj then
+    error("Tree object not found: " .. tree_sha)
+  end
+
+  local data = tree_obj.data
+  local pos  = 1
+
+  while pos <= #data do
+    -- "mode name\0<20-byte-sha>"
+    local space = data:find(" ", pos, true)
+    local mode  = data:sub(pos, space - 1)
+    pos = space + 1
+
+    local null = data:find("\0", pos, true)
+    local name = data:sub(pos, null - 1)
+    pos = null + 1
+
+    local sha = ""
+    for i = 0, 19 do
+      sha = sha .. string.format("%02x", data:byte(pos + i))
+    end
+    pos = pos + 20
+
+    local full_path = work_dir .. "/" .. name
+
+    if mode == "40000" or mode == "040000" then
+      -- Sub-tree (directory)
+      if not filesystem.isDirectory(full_path) then
+        filesystem.makeDirectory(full_path)
+      end
+      checkout(git_dir, full_path, sha, objects)
+    else
+      -- Blob (file)
+      local blob = objects[sha]
+      if blob then
+        local f = io.open(full_path, "wb")
+        f:write(blob.data)
+        f:close()
+      else
+        print("  WARNING: blob not found for " .. full_path .. " (" .. sha .. ")")
+      end
+    end
+  end
 end
 
-local function save_remote_meta(repo_dir, remote_url, branch_ref)
-  write_file(repo_dir .. "/.git/gitlite.remote", "url=" .. remote_url .. "\nref=" .. branch_ref .. "\n")
+--------------------------------------------------------------------------------
+-- clone(remote_url, target_dir)
+--   The main entry point – ties everything together.
+--------------------------------------------------------------------------------
+local function clone(remote_url, target_dir)
+  -- 1. Discover refs
+  local refs = discover_refs(remote_url)
+
+  -- Pick HEAD: prefer main, then master, then any other branch
+  local head_ref, head_sha
+  for _, candidate in ipairs({ "refs/heads/main", "refs/heads/master" }) do
+    if refs[candidate] then
+      head_ref  = candidate
+      head_sha  = refs[candidate]
+      break
+    end
+  end
+  if not head_sha then
+    for ref, sha in pairs(refs) do
+      head_ref, head_sha = ref, sha; break
+    end
+  end
+  assert(head_sha, "No refs found on remote")
+
+  local branch = head_ref:match("refs/heads/(.+)")
+  print(string.format("HEAD → %s (%s)", branch, head_sha))
+
+  -- 2. Create local directory structure
+  local git_dir = target_dir .. "/.git"
+  for _, d in ipairs({
+    target_dir,
+    git_dir,
+    git_dir .. "/objects",
+    git_dir .. "/refs",
+    git_dir .. "/refs/heads",
+  }) do
+    if not filesystem.isDirectory(d) then filesystem.makeDirectory(d) end
+  end
+
+  -- 3. Fetch packfile
+  local response = negotiate_packfile(remote_url, head_sha)
+
+  -- 4. Demux sideband
+  print("Demultiplexing sideband...")
+  local pack_data = demux_sideband(response)
+  print(string.format("Received %d bytes of packfile data", #pack_data))
+
+  -- 5. Parse packfile (writes loose objects to .git/objects/)
+  print("Parsing packfile...")
+  local objects = parse_packfile(pack_data, git_dir)
+
+  -- 6. Write .git/HEAD and the branch ref
+  local head_f = io.open(git_dir .. "/HEAD", "w")
+  head_f:write("ref: " .. head_ref .. "\n")
+  head_f:close()
+
+  local ref_f = io.open(git_dir .. "/" .. head_ref, "w")
+  ref_f:write(head_sha .. "\n")
+  ref_f:close()
+
+  -- 7. Checkout working tree
+  local commit_obj = objects[head_sha]
+  assert(commit_obj, "HEAD commit not found in packfile: " .. head_sha)
+
+  local tree_sha = commit_obj.data:match("^tree ([0-9a-f]+)")
+  assert(tree_sha, "Could not find tree SHA in commit object")
+
+  print("Checking out tree " .. tree_sha .. " → " .. target_dir)
+  checkout(git_dir, target_dir, tree_sha, objects)
+
+  print("Done! Repository cloned to " .. target_dir)
 end
 
-local function load_remote_meta(repo_dir)
-  local text = read_file(repo_dir .. "/.git/gitlite.remote")
-  if not text then return nil end
-  local meta = {}
-  for line in text:gmatch("[^\r\n]+") do
-    local k, v = line:match("^(%w+)=(.*)$")
-    if k then meta[k] = v end
-  end
-  if not meta.url or not meta.ref then
-    return nil
-  end
-  return meta
-end
-
-local function write_head(repo_dir, branch_ref, sha)
-  write_file(repo_dir .. "/.git/HEAD", "ref: " .. branch_ref .. "\n")
-  write_file(repo_dir .. "/.git/" .. branch_ref, sha .. "\n")
-end
-
-local function read_head(repo_dir)
-  local head = read_file(repo_dir .. "/.git/HEAD")
-  if not head then return nil end
-  local ref = head:match("^ref:%s*(%S+)")
-  if not ref then
-    return nil
-  end
-  local sha = read_file(repo_dir .. "/.git/" .. ref)
-  if sha then
-    sha = trim(sha)
-  end
-  return ref, sha
-end
-
-local function clone_repo(remote_url, repo_dir)
-  repo_dir = repo_dir or (remote_url:match("([^/]+)%.git/?$") or remote_url:match("([^/]+)/?$") or "repo")
-  remote_url = trim_slashes(remote_url)
-
-  if fs.exists(repo_dir) then
-    return nil, "target already exists: " .. repo_dir
-  end
-
-  ensure_repo_layout(repo_dir)
-
-  local refs, err = fetch_remote_refs(remote_url)
-  if not refs then
-    return nil, err
-  end
-
-  local branch_ref, head_sha = choose_branch_ref(remote_url, refs)
-  if not branch_ref or not head_sha then
-    return nil, "could not determine default branch from remote"
-  end
-
-  io.stdout:write("Selected " .. branch_ref .. " @ " .. head_sha .. "\n")
-  save_remote_meta(repo_dir, remote_url, branch_ref)
-  write_head(repo_dir, branch_ref, head_sha)
-
-  local ok, fetch_err = ensure_object(repo_dir, remote_url, head_sha, {})
-  if not ok then
-    return nil, fetch_err
-  end
-
-  local ok2, checkout_err = checkout_commit(repo_dir, remote_url, head_sha, repo_dir)
-  if not ok2 then
-    return nil, checkout_err
-  end
-
-  return true
-end
-
-local function pull_repo(repo_dir)
-  local meta = load_remote_meta(repo_dir)
-  if not meta then
-    return nil, "missing .git/gitlite.remote in " .. repo_dir
-  end
-
-  local branch_ref, local_sha = read_head(repo_dir)
-  if not branch_ref then
-    branch_ref = meta.ref
-  end
-
-  local refs, err = fetch_remote_refs(meta.url)
-  if not refs then
-    return nil, err
-  end
-
-  local remote_sha = refs[branch_ref]
-  if not remote_sha then
-    return nil, "remote no longer advertises " .. branch_ref
-  end
-
-  if local_sha and local_sha:lower() == remote_sha:lower() then
-    print("Already up to date.")
-    return true
-  end
-
-  print("Updating " .. branch_ref .. " -> " .. remote_sha)
-  local ok, fetch_err = ensure_object(repo_dir, meta.url, remote_sha, {})
-  if not ok then
-    return nil, fetch_err
-  end
-
-  local ok2, checkout_err = checkout_commit(repo_dir, meta.url, remote_sha, repo_dir)
-  if not ok2 then
-    return nil, checkout_err
-  end
-
-  write_head(repo_dir, branch_ref, remote_sha)
-  save_remote_meta(repo_dir, meta.url, branch_ref)
-
-  return true
-end
-
-local function sync_repo(remote_url, repo_dir)
-  if repo_dir and fs.exists(repo_dir .. "/.git/gitlite.remote") then
-    return pull_repo(repo_dir)
-  end
-  return clone_repo(remote_url, repo_dir)
-end
-
-local function usage()
-  print([[
-gitlite - minimal dumb-HTTP Git client for OpenComputers
-
-Usage:
-  gitlite clone <url> [directory]
-  gitlite pull <directory>
-  gitlite sync <url> [directory]
-
-Examples:
-  gitlite clone https://example.com/project.git
-  gitlite clone https://example.com/project.git myproject
-  gitlite pull myproject
-]])
-end
-
-local args = {...}
-local cmd = args[1]
-
-if not cmd then
-  usage()
-  return
-end
-
-local ok, err
-if cmd == "clone" then
-  ok, err = clone_repo(args[2], args[3])
-elseif cmd == "pull" then
-  ok, err = pull_repo(args[2])
-elseif cmd == "sync" then
-  ok, err = sync_repo(args[2], args[3])
-else
-  usage()
-  return
-end
-
-if not ok then
-  io.stderr:write(tostring(err) .. "\n")
-  os.exit(1)
-end
+return {
+  clone          = clone,
+  sha1           = sha1,
+  discover_refs  = discover_refs,
+  demux_sideband = demux_sideband,
+  parse_packfile = parse_packfile,
+  apply_delta    = apply_delta,
+}
