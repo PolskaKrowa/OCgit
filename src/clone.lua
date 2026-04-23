@@ -316,7 +316,8 @@ end
 --------------------------------------------------------------------------------
 local function write_object(git_dir, sha, type_name, content)
   local obj_dir  = git_dir .. "/objects/" .. sha:sub(1, 2)
-  local obj_path = obj_dir .. "/" .. sha:sub(3)
+  local obj_path = (git_dir:sub(1,1) ~= "/" and "/" or "") .. git_dir
+                 .. "/objects/" .. sha:sub(1,2) .. "/" .. sha:sub(3)
 
   if filesystem.exists(obj_path) then return end
 
