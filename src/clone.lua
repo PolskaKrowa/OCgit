@@ -282,8 +282,8 @@ local function inflate_at(data, pos, expected_size)
   -- but add headroom for zlib header/trailer and edge cases.
   local lo = 6                          -- absolute minimum zlib stream
   local hi = math.min(
-    math.max(expected_size + 512, 256), -- generous upper bound
-    #data - pos + 1                     -- can't exceed remaining data
+    math.max(expected_size * 2 + 128, 512),  -- was expected_size + 512, too tight for tiny objects
+    #data - pos + 1
   )
 
   -- Find the smallest suffix [pos .. pos+N-1] that inflates successfully.
@@ -312,7 +312,7 @@ local function inflate_at(data, pos, expected_size)
     end
   end
 
-  return best_result, pos + best_len
+  return best_result, pos + best_len + 4
 end
 
 --------------------------------------------------------------------------------
