@@ -1,4 +1,4 @@
--- gitlite.lua - A minimal git clone implementation for OpenOS
+-- clone.lua - A minimal git clone implementation for OpenOS
 
 local component = require("component")
 local filesystem = require("filesystem")
@@ -261,58 +261,85 @@ local function demux_sideband(response)
 end
 
 local function safe_inflate(bytes)
-  local result
-  repeat
-    local ok, res, err_msg = pcall(data_comp.inflate, bytes)
-    if not ok then error(res) end                              -- inflate threw
-    if res == nil then
-      if err_msg then
-        error("inflate failed: " .. tostring(err_msg))        -- genuine error, don't retry
-      end
-      os.sleep(0.5)                                           -- no error msg = energy shortage, retry
-    else
-      result = res
+  while true do
+    local res, err = data_comp.inflate(bytes)
+
+    if res then
+      return res
     end
-  until result ~= nil
-  return result
+
+    if err and err:find("not enough energy", 1, true) then
+      os.sleep(0.5)
+    else
+      error("inflate failed: " .. tostring(err))
+    end
+  end
 end
 
-local function inflate_at(data, pos, expected_size)
-  -- Clamp the initial window: compressed size is almost always <= uncompressed,
-  -- but add headroom for zlib header/trailer and edge cases.
-  local lo = 6                          -- absolute minimum zlib stream
+local function make_inflater(data, pos, expected_size)
+  local lo = 6
   local hi = math.min(
-    math.max(expected_size * 2 + 128, 512),  -- was expected_size + 512, too tight for tiny objects
+    math.max(expected_size * 2 + 128, 512),
     #data - pos + 1
   )
 
-  -- Find the smallest suffix [pos .. pos+N-1] that inflates successfully.
-  -- This gives us the exact compressed length without any stream-parsing.
   local best_result = nil
   local best_len    = nil
+  local phase       = "verify" -- then "search"
+  local mid         = nil
 
-  -- First confirm the full window actually works
-  local full = safe_inflate(data:sub(pos, pos + hi - 1))
-  assert(full and #full == expected_size,
-    string.format("inflate_at: expected %d bytes, got %s", expected_size, tostring(full and #full)))
+  return function()
+    -- Phase 1: verify upper bound once
+    if phase == "verify" then
+      local res, err = component.data.inflate(data:sub(pos, pos + hi - 1))
+      if not res then
+        if err and err:find("not enough energy", 1, true) then
+          return nil, "retry"
+        else
+          error("inflate verify failed: " .. tostring(err))
+        end
+      end
 
-  best_result = full
-  best_len    = hi
+      assert(#res == expected_size,
+        string.format("inflate_at: expected %d, got %d", expected_size, #res))
 
-  -- Binary search downward to find the true stream boundary
-  while lo < hi do
-    local mid = math.floor((lo + hi) / 2)
-    local ok, res = pcall(safe_inflate, data:sub(pos, pos + mid - 1))
-    if ok and res and #res == expected_size then
       best_result = res
-      best_len    = mid
-      hi          = mid
-    else
-      lo = mid + 1
+      best_len    = hi
+      phase       = "search"
+      return nil, "continue"
     end
-  end
 
-  return best_result, pos + best_len + 4
+    -- Phase 2: binary search, one step per call
+    if lo < hi then
+      mid = math.floor((lo + hi) / 2)
+
+      local res, err = component.data.inflate(data:sub(pos, pos + mid - 1))
+      if not res then
+        if err and err:find("not enough energy", 1, true) then
+          return nil, "retry"
+        end
+        -- invalid slice → too short
+        lo = mid + 1
+        return nil, "continue"
+      end
+
+      if #res == expected_size then
+        best_result = res
+        best_len    = mid
+        hi          = mid
+      else
+        lo = mid + 1
+      end
+
+      return nil, "continue"
+    end
+
+    -- Done
+    return {
+      data = best_result,
+      next_pos = pos + best_len - 4  -- keep your Adler-32 correction
+    }, "done"
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -505,8 +532,26 @@ local function parse_packfile(pack_data, git_dir)
     else
       -- ── Regular object (commit / tree / blob / tag) ──────────────────────
       local type_name            = TYPE_NAMES[obj_type]
-      local content, new_pos     = inflate_at(pack_data, pos, size)
-      pos                        = new_pos
+      local inflater = make_inflater(pack_data, pos, size)
+
+      local result
+      while true do
+        local out, status = inflater()
+
+        if status == "retry" then
+          os.sleep(0.5)
+
+        elseif status == "continue" then
+          os.sleep(0) -- yield, let energy recharge a tick
+
+        elseif status == "done" then
+          result = out
+          break
+        end
+      end
+
+      local content = result.data
+      pos = result.next_pos
 
       local store = type_name .. " " .. #content .. "\0" .. content
       local sha   = sha1(store)
