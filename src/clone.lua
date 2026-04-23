@@ -257,51 +257,31 @@ local function demux_sideband(response)
 end
 
 local function inflate_at(data, pos, expected_size)
-  -- Git packfile objects are zlib-wrapped deflate streams:
-  --   2 bytes  : zlib header (e.g. 0x78 0x9C)
-  --   N bytes  : raw deflate data
-  --   4 bytes  : Adler-32 checksum
-  -- component.data.inflate() expects RAW deflate only, so we must skip
-  -- the 2-byte header and account for the 4-byte trailer.
-  local ZLIB_HEADER   = 2
-  local ZLIB_TRAILER  = 4
+  local ZLIB_HEADER  = 2
+  local ZLIB_TRAILER = 4
   local raw_pos = pos + ZLIB_HEADER
   local avail   = #data - raw_pos + 1
 
-  if avail <= 0 then
-    error(string.format("No data to inflate at pos %d (data length %d)", pos, #data))
+  -- DEBUG: print hex of the 16 bytes at this position
+  local hex = ""
+  for i = pos, math.min(pos + 15, #data) do
+    hex = hex .. string.format("%02x ", data:byte(i))
+  end
+  print(string.format("[inflate_at] pos=%d expected=%d avail=%d bytes: %s", pos, expected_size, avail, hex))
+
+  -- Try inflating at pos (no skip), pos+1, and pos+2 to see which works
+  for skip = 0, 3 do
+    local ok, res = pcall(data_comp.inflate, data:sub(pos + skip))
+    local sz = (ok and res) and #res or "nil"
+    print(string.format("  skip=%d ok=%s size=%s", skip, tostring(ok), tostring(sz)))
+    if ok and res then break end
   end
 
-  -- Initial inflate on the full remaining raw-deflate buffer
-  local ok, result = pcall(data_comp.inflate, data:sub(raw_pos))
-  if not ok or result == nil then
-    error(string.format("inflate failed at pos %d: %s", pos, tostring(result)))
-  end
+  -- Also check if inflate returns a second value (error message)
+  local ok2, r2, e2 = pcall(data_comp.inflate, data:sub(pos))
+  print(string.format("  full call: ok=%s r2=%s e2=%s", tostring(ok2), tostring(r2), tostring(e2)))
 
-  -- Binary-search for the minimum raw-deflate byte count that yields expected_size.
-  local lo, hi         = 2, avail
-  local consumed_raw   = avail
-
-  while lo <= hi do
-    local mid = math.floor((lo + hi) / 2)
-    local pok, pres = pcall(data_comp.inflate, data:sub(raw_pos, raw_pos + mid - 1))
-    if pok and pres and #pres == expected_size then
-      consumed_raw = mid
-      result       = pres
-      hi           = mid - 1
-    else
-      lo = mid + 1
-    end
-  end
-
-  if #result ~= expected_size then
-    error(string.format(
-      "inflate size mismatch at pos %d: expected %d bytes, got %d",
-      pos, expected_size, #result))
-  end
-
-  -- Advance past: zlib header + raw deflate bytes + Adler-32 trailer
-  return result, pos + ZLIB_HEADER + consumed_raw + ZLIB_TRAILER
+  error("stopping for debug")
 end
 
 --------------------------------------------------------------------------------
