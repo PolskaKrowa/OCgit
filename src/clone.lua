@@ -259,11 +259,13 @@ end
 local function safe_inflate(bytes)
   local result
   repeat
-    local ok, res = pcall(data_comp.inflate, bytes)
-    if not ok then error(res) end
+    local ok, res, err_msg = pcall(data_comp.inflate, bytes)
+    if not ok then error(res) end                              -- inflate threw
     if res == nil then
-      -- Not enough energy; wait for capacitor to recharge
-      os.sleep(0.5)
+      if err_msg then
+        error("inflate failed: " .. tostring(err_msg))        -- genuine error, don't retry
+      end
+      os.sleep(0.5)                                           -- no error msg = energy shortage, retry
     else
       result = res
     end
@@ -272,31 +274,41 @@ local function safe_inflate(bytes)
 end
 
 local function inflate_at(data, pos, expected_size)
-  local ZLIB_HEADER  = 2
-  local ZLIB_TRAILER = 4
-  local raw_pos = pos + ZLIB_HEADER
-  local avail   = #data - raw_pos + 1
+  -- Clamp the initial window: compressed size is almost always <= uncompressed,
+  -- but add headroom for zlib header/trailer and edge cases.
+  local lo = 6                          -- absolute minimum zlib stream
+  local hi = math.min(
+    math.max(expected_size + 512, 256), -- generous upper bound
+    #data - pos + 1                     -- can't exceed remaining data
+  )
 
-  -- DEBUG: print hex of the 16 bytes at this position
-  local hex = ""
-  for i = pos, math.min(pos + 15, #data) do
-    hex = hex .. string.format("%02x ", data:byte(i))
+  -- Find the smallest suffix [pos .. pos+N-1] that inflates successfully.
+  -- This gives us the exact compressed length without any stream-parsing.
+  local best_result = nil
+  local best_len    = nil
+
+  -- First confirm the full window actually works
+  local full = safe_inflate(data:sub(pos, pos + hi - 1))
+  assert(full and #full == expected_size,
+    string.format("inflate_at: expected %d bytes, got %s", expected_size, tostring(full and #full)))
+
+  best_result = full
+  best_len    = hi
+
+  -- Binary search downward to find the true stream boundary
+  while lo < hi do
+    local mid = math.floor((lo + hi) / 2)
+    local ok, res = pcall(safe_inflate, data:sub(pos, pos + mid - 1))
+    if ok and res and #res == expected_size then
+      best_result = res
+      best_len    = mid
+      hi          = mid
+    else
+      lo = mid + 1
+    end
   end
-  print(string.format("[inflate_at] pos=%d expected=%d avail=%d bytes: %s", pos, expected_size, avail, hex))
 
-  -- Try inflating at pos (no skip), pos+1, and pos+2 to see which works
-  for skip = 0, 3 do
-    local ok, res = safe_inflate(data:sub(pos + skip))
-    local sz = (ok and res) and #res or "nil"
-    print(string.format("  skip=%d ok=%s size=%s", skip, tostring(ok), tostring(sz)))
-    if ok and res then break end
-  end
-
-  -- Also check if inflate returns a second value (error message)
-  local ok2, r2, e2 = safe_inflate(data:sub(pos))
-  print(string.format("  full call: ok=%s r2=%s e2=%s", tostring(ok2), tostring(r2), tostring(e2)))
-
-  error("stopping for debug")
+  return best_result, pos + best_len
 end
 
 --------------------------------------------------------------------------------
