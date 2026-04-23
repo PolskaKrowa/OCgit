@@ -318,16 +318,22 @@ local function write_object(git_dir, sha, type_name, content)
   local obj_dir  = git_dir .. "/objects/" .. sha:sub(1, 2)
   local obj_path = obj_dir .. "/" .. sha:sub(3)
 
-  if filesystem.exists(obj_path) then return end   -- already stored
+  if filesystem.exists(obj_path) then return end
 
   if not filesystem.isDirectory(obj_dir) then
-    filesystem.makeDirectory(obj_dir)
+    local ok, err = filesystem.makeDirectory(obj_dir)
+    if not ok then
+      error("failed to create object dir " .. obj_dir .. ": " .. tostring(err))
+    end
   end
 
   local store      = type_name .. " " .. #content .. "\0" .. content
   local compressed = data_comp.deflate(store)
 
-  local f = io.open(obj_path, "wb")
+  local f, err = io.open(obj_path, "wb")
+  if not f then
+    error("failed to open object file " .. obj_path .. ": " .. tostring(err))
+  end
   f:write(compressed)
   f:close()
 end
