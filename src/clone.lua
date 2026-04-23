@@ -256,37 +256,39 @@ local function demux_sideband(response)
   return table.concat(chunks)
 end
 
---------------------------------------------------------------------------------
--- inflate helper: binary-search for the minimum byte count that produces a
--- complete zlib stream of the expected decompressed size, then return both the
--- decompressed data and the new stream position.
---
--- component.data.inflate() is self-delimiting (it ignores trailing bytes), so
--- this lets us consume exactly the right number of bytes per object.
---------------------------------------------------------------------------------
 local function inflate_at(data, pos, expected_size)
-  local avail = #data - pos + 1
-  local lo, hi = 2, avail
-  local consumed = avail
-  local result
+  -- Git packfile objects are zlib-wrapped deflate streams:
+  --   2 bytes  : zlib header (e.g. 0x78 0x9C)
+  --   N bytes  : raw deflate data
+  --   4 bytes  : Adler-32 checksum
+  -- component.data.inflate() expects RAW deflate only, so we must skip
+  -- the 2-byte header and account for the 4-byte trailer.
+  local ZLIB_HEADER   = 2
+  local ZLIB_TRAILER  = 4
+  local raw_pos = pos + ZLIB_HEADER
+  local avail   = #data - raw_pos + 1
 
-  -- Initial inflate using the full remaining buffer
-  local ok
-  ok, result = pcall(data_comp.inflate, data:sub(pos))
+  if avail <= 0 then
+    error(string.format("No data to inflate at pos %d (data length %d)", pos, #data))
+  end
+
+  -- Initial inflate on the full remaining raw-deflate buffer
+  local ok, result = pcall(data_comp.inflate, data:sub(raw_pos))
   if not ok or result == nil then
     error(string.format("inflate failed at pos %d: %s", pos, tostring(result)))
   end
 
-  -- Binary-search for the minimum prefix that inflates to exactly expected_size.
-  -- IMPORTANT: we update `result` here too, so the returned content always
-  -- matches the correctly-bounded zlib stream.
+  -- Binary-search for the minimum raw-deflate byte count that yields expected_size.
+  local lo, hi         = 2, avail
+  local consumed_raw   = avail
+
   while lo <= hi do
     local mid = math.floor((lo + hi) / 2)
-    local pok, pres = pcall(data_comp.inflate, data:sub(pos, pos + mid - 1))
+    local pok, pres = pcall(data_comp.inflate, data:sub(raw_pos, raw_pos + mid - 1))
     if pok and pres and #pres == expected_size then
-      consumed = mid
-      result   = pres   -- ← was missing; result stayed nil before
-      hi       = mid - 1
+      consumed_raw = mid
+      result       = pres
+      hi           = mid - 1
     else
       lo = mid + 1
     end
@@ -298,7 +300,8 @@ local function inflate_at(data, pos, expected_size)
       pos, expected_size, #result))
   end
 
-  return result, pos + consumed
+  -- Advance past: zlib header + raw deflate bytes + Adler-32 trailer
+  return result, pos + ZLIB_HEADER + consumed_raw + ZLIB_TRAILER
 end
 
 --------------------------------------------------------------------------------
