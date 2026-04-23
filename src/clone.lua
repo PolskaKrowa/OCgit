@@ -131,27 +131,46 @@ end
 --   POST /git-upload-pack  with ls-refs cmd   → actual ref listing
 --------------------------------------------------------------------------------
 local function discover_refs(remote_url)
-  -- Stage 1: handshake – confirm the server speaks protocol v2
-  local info_url = remote_url .. "/info/refs?service=git-upload-pack"
+  local function dump_raw(label, raw)
+    print("[DEBUG] " .. label .. " (" .. #raw .. " bytes):")
+    -- Print first 512 bytes as escaped text so we can see the pkt-line framing
+    local preview = raw:sub(1, 512):gsub("[%c]", function(c)
+      local b = c:byte()
+      if b == 10 then return "\\n"
+      elseif b == 13 then return "\\r"
+      elseif b == 0  then return "\\0"
+      else return string.format("\\x%02x", b) end
+    end)
+    print(preview)
+    print("[DEBUG] parsed pkt-lines:")
+    for i, l in ipairs(parse_pkt_lines(raw)) do
+      print(string.format("  [%d] %s", i, tostring(l):sub(1, 120):gsub("[%c]",".")))
+      if i >= 20 then print("  ... (truncated)"); break end
+    end
+  end
+
+  -- Stage 1: capability advertisement
+  local info_url   = remote_url .. "/info/refs?service=git-upload-pack"
   local v2_headers = { ["Git-Protocol"] = "version=2" }
 
   print("Discovering refs via Protocol v2...")
   local info_resp = http_request(info_url, nil, v2_headers)
+  dump_raw("info/refs response", info_resp)
 
-  -- Verify the server advertises protocol v2 somewhere in the response
   if not info_resp:find("version 2", 1, true) then
-    -- Fall back: try to parse refs directly from the v1-style /info/refs response
+    print("[DEBUG] server did not advertise v2 – trying v1 fallback")
     local lines = parse_pkt_lines(info_resp)
     local refs  = {}
     for _, line in ipairs(lines) do
-      local sha, ref = line:match("^([0-9a-f]+)%s+(refs/heads/%S+)")
+      -- v1: "<sha> <ref>\0<capabilities>" on first line, "<sha> <ref>" after
+      local sha, ref = line:match("^([0-9a-f]+)%s+(refs/heads/[^%z%s]+)")
       if sha and ref then refs[ref] = sha end
     end
     if next(refs) then return refs end
     error("Server does not support Git protocol v2 and no v1 refs found")
   end
 
-  -- Stage 2: send ls-refs command to get the actual refs
+  -- Stage 2: ls-refs command
   local upload_url = remote_url .. "/git-upload-pack"
   local ls_headers = {
     ["Git-Protocol"]  = "version=2",
@@ -162,21 +181,21 @@ local function discover_refs(remote_url)
   local ls_payload = table.concat({
     pkt_line("command=ls-refs\n"),
     pkt_line("DELIM"),
-    pkt_line("symrefs\n"),   -- include symref-target metadata
-    pkt_line("peel\n"),      -- include peeled tag SHAs
+    pkt_line("symrefs\n"),
+    pkt_line("peel\n"),
     pkt_line("FLUSH"),
   })
 
-  local ls_resp = http_request(upload_url, ls_payload, ls_headers)
-  local lines   = parse_pkt_lines(ls_resp)
-  local refs    = {}
+  print("[DEBUG] ls-refs payload: " .. ls_payload:gsub("[%c]", "."))
 
-  -- Each line: "<sha> <refname> [symref-target:<ref>] [peeled:<sha>]"
+  local ls_resp = http_request(upload_url, ls_payload, ls_headers)
+  dump_raw("ls-refs response", ls_resp)
+
+  local lines = parse_pkt_lines(ls_resp)
+  local refs  = {}
   for _, line in ipairs(lines) do
     local sha, ref = line:match("^([0-9a-f]+)%s+(refs/heads/%S+)")
-    if sha and ref then
-      refs[ref] = sha
-    end
+    if sha and ref then refs[ref] = sha end
   end
 
   return refs
