@@ -241,14 +241,18 @@ local function demux_sideband(response)
   for _, line in ipairs(lines) do
     if line ~= "FLUSH" and line ~= "DELIM" and line ~= "RESPONSE_END" then
       local channel = line:byte(1)
-      local payload = line:sub(2)
 
-      if channel == 1 then
-        chunks[#chunks + 1] = payload          -- packfile data
-      elseif channel == 2 then
-        io.write(payload)                       -- progress (e.g. "Compressing…")
-      elseif channel == 3 then
-        error("Remote error: " .. payload)
+      -- Skip section headers ("packfile\n", "acknowledgments\n", etc.)
+      -- Real sideband lines always start with 0x01, 0x02, or 0x03
+      if channel == 1 or channel == 2 or channel == 3 then
+        local payload = line:sub(2)
+        if channel == 1 then
+          chunks[#chunks + 1] = payload
+        elseif channel == 2 then
+          io.write(payload)
+        elseif channel == 3 then
+          error("Remote error: " .. payload)
+        end
       end
     end
   end
