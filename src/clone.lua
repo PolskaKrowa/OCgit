@@ -503,8 +503,26 @@ local function parse_packfile(pack_data, git_dir)
         offset = ((offset + 1) << 7) | (byte & 0x7F)
       end
 
-      local delta_data, new_pos = inflate_at(pack_data, pos, size)
-      pos = new_pos
+      local inflater = make_inflater(pack_data, pos, size)
+
+      local result
+      while true do
+        local out, status = inflater()
+
+        if status == "retry" then
+          os.sleep(0.5)
+
+        elseif status == "continue" then
+          os.sleep(0) -- yield, let energy recharge a tick
+
+        elseif status == "done" then
+          result = out
+          break
+        end
+      end
+
+      local delta_data = result.data
+      pos = result.next_pos
 
       ofs_queue[#ofs_queue + 1] = {
         obj_offset  = obj_start,
@@ -520,8 +538,26 @@ local function parse_packfile(pack_data, git_dir)
       end
       pos = pos + 20
 
-      local delta_data, new_pos = inflate_at(pack_data, pos, size)
-      pos = new_pos
+      local inflater = make_inflater(pack_data, pos, size)
+
+      local result
+      while true do
+        local out, status = inflater()
+
+        if status == "retry" then
+          os.sleep(0.5)
+
+        elseif status == "continue" then
+          os.sleep(0) -- yield, let energy recharge a tick
+
+        elseif status == "done" then
+          result = out
+          break
+        end
+      end
+
+      local content = result.data
+      pos = result.next_pos
 
       ref_queue[#ref_queue + 1] = {
         obj_offset = obj_start,
