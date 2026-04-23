@@ -1,4 +1,4 @@
--- clone.lua - A minimal git clone implementation for OpenOS
+-- gitlite.lua - A minimal git clone implementation for OpenOS
 
 local component = require("component")
 local filesystem = require("filesystem")
@@ -125,20 +125,60 @@ end
 
 --------------------------------------------------------------------------------
 -- Step 1: Discover available refs (ls-refs)
+--
+-- Protocol v2 works in two stages:
+--   GET  /info/refs?service=git-upload-pack   → capability advertisement only
+--   POST /git-upload-pack  with ls-refs cmd   → actual ref listing
 --------------------------------------------------------------------------------
 local function discover_refs(remote_url)
-  local url     = remote_url .. "/info/refs?service=git-upload-pack"
-  local headers = { ["Git-Protocol"] = "version=2" }
+  -- Stage 1: handshake – confirm the server speaks protocol v2
+  local info_url = remote_url .. "/info/refs?service=git-upload-pack"
+  local v2_headers = { ["Git-Protocol"] = "version=2" }
 
   print("Discovering refs via Protocol v2...")
-  local response = http_request(url, nil, headers)
-  local lines    = parse_pkt_lines(response)
-  local refs     = {}
+  local info_resp = http_request(info_url, nil, v2_headers)
 
+  -- Verify the server advertises protocol v2 somewhere in the response
+  if not info_resp:find("version 2", 1, true) then
+    -- Fall back: try to parse refs directly from the v1-style /info/refs response
+    local lines = parse_pkt_lines(info_resp)
+    local refs  = {}
+    for _, line in ipairs(lines) do
+      local sha, ref = line:match("^([0-9a-f]+)%s+(refs/heads/%S+)")
+      if sha and ref then refs[ref] = sha end
+    end
+    if next(refs) then return refs end
+    error("Server does not support Git protocol v2 and no v1 refs found")
+  end
+
+  -- Stage 2: send ls-refs command to get the actual refs
+  local upload_url = remote_url .. "/git-upload-pack"
+  local ls_headers = {
+    ["Git-Protocol"]  = "version=2",
+    ["Content-Type"]  = "application/x-git-upload-pack-request",
+    ["Accept"]        = "application/x-git-upload-pack-result",
+  }
+
+  local ls_payload = table.concat({
+    pkt_line("command=ls-refs\n"),
+    pkt_line("DELIM"),
+    pkt_line("symrefs\n"),   -- include symref-target metadata
+    pkt_line("peel\n"),      -- include peeled tag SHAs
+    pkt_line("FLUSH"),
+  })
+
+  local ls_resp = http_request(upload_url, ls_payload, ls_headers)
+  local lines   = parse_pkt_lines(ls_resp)
+  local refs    = {}
+
+  -- Each line: "<sha> <refname> [symref-target:<ref>] [peeled:<sha>]"
   for _, line in ipairs(lines) do
     local sha, ref = line:match("^([0-9a-f]+)%s+(refs/heads/%S+)")
-    if sha and ref then refs[ref] = sha end
+    if sha and ref then
+      refs[ref] = sha
+    end
   end
+
   return refs
 end
 
