@@ -270,19 +270,32 @@ local function inflate_at(data, pos, expected_size)
   local consumed = avail
   local result
 
-  -- Get the actual content using the full remaining buffer first
-  result = data_comp.inflate(data:sub(pos))
+  -- Initial inflate using the full remaining buffer
+  local ok
+  ok, result = pcall(data_comp.inflate, data:sub(pos))
+  if not ok or result == nil then
+    error(string.format("inflate failed at pos %d: %s", pos, tostring(result)))
+  end
 
-  -- Binary-search for the minimum prefix that still inflates to expected_size
+  -- Binary-search for the minimum prefix that inflates to exactly expected_size.
+  -- IMPORTANT: we update `result` here too, so the returned content always
+  -- matches the correctly-bounded zlib stream.
   while lo <= hi do
     local mid = math.floor((lo + hi) / 2)
-    local ok, res = pcall(data_comp.inflate, data:sub(pos, pos + mid - 1))
-    if ok and res and #res == expected_size then
+    local pok, pres = pcall(data_comp.inflate, data:sub(pos, pos + mid - 1))
+    if pok and pres and #pres == expected_size then
       consumed = mid
-      hi = mid - 1
+      result   = pres   -- ← was missing; result stayed nil before
+      hi       = mid - 1
     else
       lo = mid + 1
     end
+  end
+
+  if #result ~= expected_size then
+    error(string.format(
+      "inflate size mismatch at pos %d: expected %d bytes, got %d",
+      pos, expected_size, #result))
   end
 
   return result, pos + consumed
