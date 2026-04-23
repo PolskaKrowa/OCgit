@@ -256,6 +256,21 @@ local function demux_sideband(response)
   return table.concat(chunks)
 end
 
+local function safe_inflate(bytes)
+  local result
+  repeat
+    local ok, res = pcall(data_comp.inflate, bytes)
+    if not ok then error(res) end
+    if res == nil then
+      -- Not enough energy; wait for capacitor to recharge
+      os.sleep(0.5)
+    else
+      result = res
+    end
+  until result ~= nil
+  return result
+end
+
 local function inflate_at(data, pos, expected_size)
   local ZLIB_HEADER  = 2
   local ZLIB_TRAILER = 4
@@ -271,14 +286,14 @@ local function inflate_at(data, pos, expected_size)
 
   -- Try inflating at pos (no skip), pos+1, and pos+2 to see which works
   for skip = 0, 3 do
-    local ok, res = pcall(data_comp.inflate, data:sub(pos + skip))
+    local ok, res = safe_inflate(data:sub(pos + skip))
     local sz = (ok and res) and #res or "nil"
     print(string.format("  skip=%d ok=%s size=%s", skip, tostring(ok), tostring(sz)))
     if ok and res then break end
   end
 
   -- Also check if inflate returns a second value (error message)
-  local ok2, r2, e2 = pcall(data_comp.inflate, data:sub(pos))
+  local ok2, r2, e2 = safe_inflate(data:sub(pos))
   print(string.format("  full call: ok=%s r2=%s e2=%s", tostring(ok2), tostring(r2), tostring(e2)))
 
   error("stopping for debug")
