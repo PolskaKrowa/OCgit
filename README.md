@@ -34,6 +34,8 @@ These are fetched automatically by the installer — you don't need to grab them
 | `deflate.lua` | [Magik6k-Programs/libdeflate](https://github.com/OpenPrograms/Magik6k-Programs/tree/master/libdeflate) | Pure-Lua zlib inflate |
 | `crc32.lua` | [Magik6k-Programs/libcrc32](https://github.com/OpenPrograms/Magik6k-Programs/tree/master/libcrc32) | CRC-32 (required by deflate) |
 
+^ many thanks for these libraries, which make it possible to implement Git's packfile format!
+
 ---
 
 ## Installation
