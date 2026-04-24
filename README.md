@@ -41,7 +41,7 @@ These are fetched automatically by the installer — you don't need to grab them
 Paste this into your OpenOS terminal to download and run the installer:
 
 ```sh
-wget https://raw.githubusercontent.com/PolskaKrowa/OCgit/refs/heads/main/install.lua install.lua && install
+wget https://raw.githubusercontent.com/PolskaKrowa/OCgit/refs/heads/main/install.lua install.lua && ./install
 ```
 
 The installer will:
