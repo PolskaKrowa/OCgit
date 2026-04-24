@@ -49,7 +49,7 @@ wget https://raw.githubusercontent.com/PolskaKrowa/OCgit/refs/heads/main/install
 The installer will:
 1. Download `OCgit.lua` → `/bin/`
 2. Download all library modules → `/lib/`
-3. Offer to reboot your computer
+3. Offer to reboot your computer (required to update the `package.path`)
 
 ---
 
