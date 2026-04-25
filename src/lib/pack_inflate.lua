@@ -37,7 +37,46 @@ do
 end
 
 --------------------------------------------------------------------------------
--- safe_inflate / safe_deflate
+-- silent_inflate_zlib
+-- Calls cpu_deflate.inflate_zlib with stdout suppressed for the duration.
+-- The third-party library prints "trailing garbage ignored" and similar
+-- diagnostics directly via io.write/print; we redirect those to dbg so they
+-- don't pollute the OC console.
+--------------------------------------------------------------------------------
+local function silent_inflate_zlib(opts)
+  local captured = {}
+  local orig_print    = print
+  local orig_io_write = io.write
+
+  -- Redirect both print() and io.write() used by the library
+  print = function(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+      parts[i] = tostring(select(i, ...))
+    end
+    captured[#captured + 1] = table.concat(parts, "\t")
+  end
+  io.write = function(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+      parts[i] = tostring(select(i, ...))
+    end
+    captured[#captured + 1] = table.concat(parts)
+  end
+
+  local ok, err = pcall(M.cpu_deflate.inflate_zlib, opts)
+
+  print    = orig_print
+  io.write = orig_io_write
+
+  if D.DEBUG_INFLATE and #captured > 0 then
+    for _, line in ipairs(captured) do
+      dbg("inflate_zlib (suppressed): %s", line)
+    end
+  end
+
+  if not ok then error(err, 2) end
+end
 -- Wrap the data component calls, retrying on "not enough energy" errors.
 --------------------------------------------------------------------------------
 function M.safe_inflate(bytes)
@@ -247,18 +286,16 @@ function M.inflate_zlib_slice(data, pos, expected_size)
   end
 
   -- ── Chunked output buffering ──────────────────────────────────────────────
-  -- Bytes are flushed into fixed-size chunks.  We never call table.concat over
-  -- the full output; callers receive the chunks table directly and call
-  -- M.chunks_to_string() only when they truly need a single string.
+  -- Accumulate into a fixed-size buffer rather than one string.char() per byte.
   local CHUNK_SIZE = 8192
   local chunks     = {}
   local buf        = {}
   local buf_n      = 0
-  local total_len  = 0   -- tracked in the callback; avoids #string on huge data
+  local total_len  = 0
   local bytes_read = 0
 
   local ok, err = pcall(function()
-    M.cpu_deflate.inflate_zlib({
+    silent_inflate_zlib({
       input  = input_slice,
       output = function(byte)
         buf_n      = buf_n + 1
@@ -273,7 +310,7 @@ function M.inflate_zlib_slice(data, pos, expected_size)
     })
   end)
 
-  input_slice = nil  -- release compressed input before any further allocation
+  input_slice = nil
 
   if not ok then
     dbg("inflate_zlib_slice: inflate_zlib error: %s", tostring(err))
@@ -285,7 +322,6 @@ function M.inflate_zlib_slice(data, pos, expected_size)
   end
   buf = nil
 
-  -- Size check uses the counter, not #string – no full concat needed here.
   if D.DEBUG_INFLATE then
     dbg("inflate_zlib_slice: inflated %d bytes, bytes_read=%d next_pos=%d (expected_size=%d)",
         total_len, bytes_read, pos + bytes_read, expected_size)
@@ -294,31 +330,18 @@ function M.inflate_zlib_slice(data, pos, expected_size)
   assert(total_len == expected_size,
     string.format("inflate_zlib_slice: size mismatch: got %d, expected %d", total_len, expected_size))
 
-  -- ── Reliability guards ────────────────────────────────────────────────────
-  -- Fall back to binary search if:
-  --   (a) bytes_read == 0: libdeflate build doesn't support bytes_read_callback, or
-  --   (b) bytes_read >= input_hi: libdeflate consumed the entire slice without
-  --       finding a natural stream boundary, which means we may have truncated
-  --       the stream and next_pos would be wrong.
   if bytes_read == 0 then
     dbg("inflate_zlib_slice: WARNING – bytes_read_callback not supported; falling back to bsearch")
-    -- chunks may already hold the correct output, but bsearch discards known_chunks
-    -- and re-inflates cleanly, so pass nil to make the discard explicit.
     return M.inflate_zlib_slice_bsearch(data, pos, expected_size, nil)
   end
 
   if bytes_read >= input_hi then
-    -- This is the bug that caused the nil-byte error: bytes_read == input_hi
-    -- meant next_pos was calculated from a truncated slice ceiling, not the
-    -- real stream end.  The content itself may also be from a wrong stream,
-    -- so discard it and let bsearch re-inflate cleanly.
     dbg("inflate_zlib_slice: WARNING – bytes_read (%d) reached input_hi (%d); " ..
         "stream may have been truncated, discarding content and falling back to bsearch",
         bytes_read, input_hi)
     return M.inflate_zlib_slice_bsearch(data, pos, expected_size, nil)
   end
 
-  -- Return the chunks table; callers use M.chunks_to_string() if needed.
   return chunks, pos + bytes_read
 end
 
@@ -327,30 +350,21 @@ end
 --
 -- Identical to the old inflate_zlib_slice: binary-searches for the shortest
 -- input prefix that produces exactly expected_size bytes of output.
--- `known_chunks` is accepted for API compatibility but is always discarded;
+-- `known_chunks` is accepted for API compatibility but always discarded;
 -- bsearch re-inflates cleanly from scratch.
 --------------------------------------------------------------------------------
 function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_chunks)
-  -- Use the same generous ceiling as inflate_zlib_slice so that if we arrive
-  -- here via the bytes_read >= input_hi guard, hi is large enough to cover
-  -- the full stream.
   local available   = #data - pos + 1
   local lo          = 6
   local hi          = math.min(math.max(expected_size + 512, 1024), available)
-  local best_chunks = nil   -- do NOT pre-seed with known_chunks; it may be
-  local best_len    = hi    -- from a truncated inflate and therefore wrong.
-                            -- The bsearch will re-inflate hi on the first step.
+  local best_chunks = nil
+  local best_len    = hi
 
   if D.DEBUG_INFLATE then
     dbg("inflate_zlib_slice_bsearch: pos=%d expected_size=%d search_range=[%d,%d] known_chunks=%s",
         pos, expected_size, lo, hi, known_chunks and "provided (discarded)" or "nil")
   end
 
-  -- ── Local helper: inflate a slice into a chunks table ────────────────────
-  -- Returns chunks_table, total_len.  chunks_table is nil on inflate error.
-  -- Uses 8 KB flush buckets to keep per-byte Lua object overhead low.
-  -- Critically: never calls table.concat over the *full* output, so memory
-  -- peak is bounded by one 8 KB bucket plus the chunks table.
   local CHUNK = 8192
   local function inflate_to_chunks(slice)
     local ch    = {}
@@ -358,7 +372,7 @@ function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_chunks)
     local buf_n = 0
     local total = 0
     local ok = pcall(function()
-      M.cpu_deflate.inflate_zlib({
+      silent_inflate_zlib({
         input  = slice,
         output = function(byte)
           buf_n = buf_n + 1
@@ -371,22 +385,16 @@ function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_chunks)
         end,
       })
     end)
-    if buf_n > 0 then
-      ch[#ch + 1] = table.concat(buf, "", 1, buf_n)
-    end
+    if buf_n > 0 then ch[#ch + 1] = table.concat(buf, "", 1, buf_n) end
     if not ok then return nil, 0 end
     return ch, total
   end
 
-  -- ── Verify the upper bound before searching ───────────────────────────────
-  -- Same as make_inflater's verify phase; gives us the correct best_chunks for
-  -- hi regardless of how we arrived here.
   do
     local ch, total = inflate_to_chunks(data:sub(pos, pos + hi - 1))
     if ch and total == expected_size then
       best_chunks = ch
     else
-      -- hi is still not large enough; fall back to the full remaining slice.
       dbg("inflate_zlib_slice_bsearch: WARNING – hi=%d still too small, using full available=%d", hi, available)
       hi = available
       ch, total = inflate_to_chunks(data:sub(pos, pos + hi - 1))
@@ -407,7 +415,7 @@ function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_chunks)
       if D.DEBUG_INFLATE then
         dbg("inflate_zlib_slice_bsearch[step %d]: mid=%d OK, narrowing hi", step, mid)
       end
-      best_chunks = ch    -- discard previous winner; GC will free it
+      best_chunks = ch
       best_len    = mid
       hi          = mid
     else
@@ -415,7 +423,6 @@ function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_chunks)
         dbg("inflate_zlib_slice_bsearch[step %d]: mid=%d failed, raising lo", step, mid)
       end
       lo = mid + 1
-      -- ch is unreferenced here and will be collected
     end
   end
 
@@ -430,10 +437,8 @@ end
 
 --------------------------------------------------------------------------------
 -- chunks_to_string
---
--- Materialise a chunks table into a single Lua string.  Call this only when
--- you genuinely need one contiguous string (e.g. hashing, comparison).
--- For large objects, prefer iterating over the chunks table directly.
+-- Materialise a chunks table into one Lua string.  Call only when a single
+-- contiguous string is genuinely required (hashing, concatenation, etc.).
 --------------------------------------------------------------------------------
 function M.chunks_to_string(chunks)
   return table.concat(chunks)
@@ -442,12 +447,8 @@ end
 --------------------------------------------------------------------------------
 -- inflate_pack_object
 --
--- Public entry point: inflates one pack object starting at `pos` in `data`,
--- dispatching to either the cpu or datacard path.
--- Returns: chunks (table of strings), next_pos (integer)
---
--- The returned `chunks` table avoids a single large allocation.  Call
--- M.chunks_to_string(chunks) if you need one contiguous string.
+-- Public entry point.  Returns: chunks (table of strings), next_pos (integer).
+-- Call M.chunks_to_string(chunks) if a single string is needed.
 --------------------------------------------------------------------------------
 function M.inflate_pack_object(data, pos, expected_size)
   if D.DEBUG_INFLATE then
@@ -489,9 +490,144 @@ function M.inflate_pack_object(data, pos, expected_size)
         dbg("inflate_pack_object: datacard path done after %d loops, next_pos=%d consumed=%d bytes",
             loop_count, out.next_pos, out.next_pos - pos)
       end
-      -- Wrap the datacard string in a single-element chunks table so the
-      -- return type is uniform with the cpu path.
+      -- Wrap datacard string in a single-element table for a uniform API.
       return {out.data}, out.next_pos
+    end
+  end
+end
+  -- Use the same generous ceiling as inflate_zlib_slice so that if we arrive
+  -- here via the bytes_read >= input_hi guard, hi is large enough to cover
+  -- the full stream.
+  local available    = #data - pos + 1
+  local lo           = 6
+  local hi           = math.min(math.max(expected_size + 512, 1024), available)
+  local best_content = nil   -- do NOT pre-seed with known_content; it may be
+  local best_len     = hi    -- from a truncated inflate and therefore wrong.
+                             -- The bsearch will re-inflate hi on the first step.
+
+  if D.DEBUG_INFLATE then
+    dbg("inflate_zlib_slice_bsearch: pos=%d expected_size=%d search_range=[%d,%d] known_content=%s",
+        pos, expected_size, lo, hi, known_content and "provided (discarded)" or "nil")
+  end
+
+  -- Verify the upper bound before searching (same as make_inflater's verify phase).
+  -- This also gives us the correct best_content for hi regardless of how we arrived here.
+  do
+    local out = {}
+    local ok  = pcall(function()
+      silent_inflate_zlib({
+        input  = data:sub(pos, pos + hi - 1),
+        output = function(byte) out[#out + 1] = string.char(byte) end,
+      })
+    end)
+    local c = ok and table.concat(out) or nil
+    if c and #c == expected_size then
+      best_content = c
+    else
+      -- hi is still not large enough; fall back to the full remaining slice.
+      dbg("inflate_zlib_slice_bsearch: WARNING – hi=%d still too small, using full available=%d", hi, available)
+      hi = available
+      out = {}
+      pcall(function()
+        silent_inflate_zlib({
+          input  = data:sub(pos, pos + hi - 1),
+          output = function(byte) out[#out + 1] = string.char(byte) end,
+        })
+      end)
+      best_content = table.concat(out)
+      assert(#best_content == expected_size,
+        string.format("inflate_zlib_slice_bsearch: even full slice failed: got %d, expected %d",
+          #best_content, expected_size))
+    end
+  end
+
+  local step = 0
+  while lo < hi do
+    os.sleep(0)
+    step = step + 1
+    local mid = math.floor((lo + hi) / 2)
+    local out  = {}
+    local ok   = pcall(function()
+      silent_inflate_zlib({
+        input  = data:sub(pos, pos + mid - 1),
+        output = function(byte) out[#out + 1] = string.char(byte) end,
+      })
+    end)
+    local c = ok and table.concat(out) or nil
+    if c and #c == expected_size then
+      if D.DEBUG_INFLATE then
+        dbg("inflate_zlib_slice_bsearch[step %d]: mid=%d OK, narrowing hi", step, mid)
+      end
+      best_content = c
+      best_len     = mid
+      hi           = mid
+    else
+      if D.DEBUG_INFLATE then
+        dbg("inflate_zlib_slice_bsearch[step %d]: mid=%d failed, raising lo", step, mid)
+      end
+      lo = mid + 1
+    end
+  end
+
+  if D.DEBUG_INFLATE then
+    dbg("inflate_zlib_slice_bsearch: done after %d steps, best_len=%d next_pos=%d",
+        step, best_len, pos + best_len)
+  end
+
+  assert(best_content, "inflate_zlib_slice_bsearch: failed to find stream boundary")
+  return best_content, pos + best_len
+end
+
+--------------------------------------------------------------------------------
+-- inflate_pack_object
+--
+-- Public entry point: inflates one pack object starting at `pos` in `data`,
+-- dispatching to either the cpu or datacard path.
+-- Returns: content (string), next_pos (integer)
+--------------------------------------------------------------------------------
+function M.inflate_pack_object(data, pos, expected_size)
+  if D.DEBUG_INFLATE then
+    dbg("inflate_pack_object: pos=%d expected_size=%d path=%s",
+        pos, expected_size, M.cpu_deflate and "cpu" or "datacard")
+  end
+
+  if M.cpu_deflate then
+    if D.DEBUG_INFLATE then
+      dbg("inflate_pack_object: using cpu_deflate path (inflate_zlib_slice)")
+    end
+    local content, next_pos = M.inflate_zlib_slice(data, pos, expected_size)
+    assert(content, "inflate failed: cpu inflater returned no output")
+    assert(#content == expected_size,
+      string.format("inflate_at: expected %d, got %d", expected_size, #content))
+    if D.DEBUG_INFLATE then
+      dbg("inflate_pack_object: cpu path done, next_pos=%d consumed=%d bytes",
+          next_pos, next_pos - pos)
+    end
+    return content, next_pos
+  end
+
+  if D.DEBUG_INFLATE then
+    dbg("inflate_pack_object: using datacard path (make_inflater binary search)")
+  end
+  local inflater   = M.make_inflater(data, pos, expected_size)
+  local loop_count = 0
+  while true do
+    loop_count = loop_count + 1
+    local out, status = inflater()
+
+    if status == "retry" then
+      if D.DEBUG_INFLATE then
+        dbg("inflate_pack_object: loop %d – retry (energy wait 0.5s)", loop_count)
+      end
+      os.sleep(0.5)
+    elseif status == "continue" then
+      os.sleep(0)
+    elseif status == "done" then
+      if D.DEBUG_INFLATE then
+        dbg("inflate_pack_object: datacard path done after %d loops, next_pos=%d consumed=%d bytes",
+            loop_count, out.next_pos, out.next_pos - pos)
+      end
+      return out.data, out.next_pos
     end
   end
 end
