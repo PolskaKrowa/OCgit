@@ -20,8 +20,6 @@ local M = {}
 --------------------------------------------------------------------------------
 function M.discover_refs(remote_url)
   local function dump_raw(label, raw)
-    print("[DEBUG] " .. label .. " (" .. #raw .. " bytes):")
-    -- Print first 512 bytes as escaped text so we can see the pkt-line framing
     local preview = raw:sub(1, 512):gsub("[%c]", function(c)
       local b = c:byte()
       if b == 10 then return "\\n"
@@ -29,12 +27,6 @@ function M.discover_refs(remote_url)
       elseif b == 0  then return "\\0"
       else return string.format("\\x%02x", b) end
     end)
-    print(preview)
-    print("[DEBUG] parsed pkt-lines:")
-    for i, l in ipairs(parse_pkt_lines(raw)) do
-      print(string.format("  [%d] %s", i, tostring(l):sub(1, 120):gsub("[%c]",".")))
-      if i >= 20 then print("  ... (truncated)"); break end
-    end
   end
 
   -- Stage 1: capability advertisement
@@ -46,7 +38,6 @@ function M.discover_refs(remote_url)
   dump_raw("info/refs response", info_resp)
 
   if not info_resp:find("version 2", 1, true) then
-    print("[DEBUG] server did not advertise v2 – trying v1 fallback")
     local lines = parse_pkt_lines(info_resp)
     local refs  = {}
     for _, line in ipairs(lines) do
@@ -73,8 +64,6 @@ function M.discover_refs(remote_url)
     pkt_line("peel\n"),
     pkt_line("FLUSH"),
   })
-
-  print("[DEBUG] ls-refs payload: " .. ls_payload:gsub("[%c]", "."))
 
   local ls_resp = http_request(upload_url, ls_payload, ls_headers)
   dump_raw("ls-refs response", ls_resp)
