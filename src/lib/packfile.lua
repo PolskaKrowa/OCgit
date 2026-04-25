@@ -10,6 +10,8 @@ local data_comp = component.data
 local D = require("debug")
 local dbg         = D.dbg
 local dbg_hex     = D.dbg_hex
+local dbg_enter   = D.dbg_enter
+local dbg_leave   = D.dgb_leave
 
 local M = {}
 
