@@ -127,7 +127,7 @@ function M.apply_delta(base, delta)
   -- Yield every 32 commands so the OC energy capacitor can recharge.
   -- apply_delta is pure Lua but large blobs can have thousands of COPY
   -- instructions; without yielding the capacitor drains mid-loop.
-  local YIELD_EVERY = 32
+  local YIELD_EVERY = 16
 
   while pos <= #delta do
     local cmd = delta:byte(pos); pos = pos + 1
@@ -382,11 +382,8 @@ function M.parse_packfile(pack_data, git_dir)
 
     -- OFS_DELTA
     local remaining_ofs = {}
-    local delta_count = 0
     for _, entry in ipairs(ofs_queue) do
       os.sleep(0)
-      delta_count = delta_count + 1
-      if delta_count % 64 == 0 then os.sleep(0.5) end
       local base_sha = off_to_sha[entry.base_offset]
       local base_obj = base_sha and objects[base_sha]
 
@@ -430,11 +427,8 @@ function M.parse_packfile(pack_data, git_dir)
 
     -- REF_DELTA
     local remaining_ref = {}
-    delta_count = 0  -- Reset for REF_DELTA
     for _, entry in ipairs(ref_queue) do
       os.sleep(0)
-      delta_count = delta_count + 1
-      if delta_count % 64 == 0 then os.sleep(0.5) end
       local base_obj = objects[entry.base_sha]
 
       if not base_obj then
