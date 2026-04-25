@@ -509,6 +509,10 @@ function M.inflate_pack_object(data, pos, expected_size)
   end
 end
 
+function M.write_object(git_dir, sha, type_name, content)
+  dbg("write_object: deferred (RAM-only) %s %s", type_name, sha)
+end
+
 --------------------------------------------------------------------------------
 -- Parse the Packfile
 --
