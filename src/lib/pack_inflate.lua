@@ -248,7 +248,7 @@ function M.inflate_zlib_slice(data, pos, expected_size)
 
   -- ── Chunked output buffering ──────────────────────────────────────────────
   -- Accumulate into a fixed-size buffer rather than one string.char() per byte.
-  local CHUNK_SIZE = 512
+  local CHUNK_SIZE = 2048
   local chunks     = {}
   local buf        = {}
   local buf_n      = 0
@@ -280,11 +280,18 @@ function M.inflate_zlib_slice(data, pos, expected_size)
     chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
   end
   buf = nil
-  collectgarbage("collect")  -- free buf memory before allocating content string
+  collectgarbage("collect")   -- free Lua garbage before the big alloc
 
-  local content = table.concat(chunks)
+  local concat_ok, content = pcall(table.concat, chunks)
   chunks = nil
-  collectgarbage("collect")  -- free chunks table after concat
+  collectgarbage("collect")
+
+  if not concat_ok then
+    error(string.format(
+      "inflate_zlib_slice: out of memory assembling %d-byte result " ..
+      "(expected_size=%d). Use a machine with more RAM or split the object.",
+      expected_size, expected_size))
+  end
 
   if D.DEBUG_INFLATE then
     dbg("inflate_zlib_slice: inflated %d bytes, bytes_read=%d next_pos=%d (expected_size=%d)",
