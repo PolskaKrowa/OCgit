@@ -17,8 +17,9 @@ local sha1         = util.sha1
 local read_u32_be  = util.read_u32_be
 
 local inflate = require("pack_inflate")
-local safe_deflate       = inflate.safe_deflate
+local safe_deflate        = inflate.safe_deflate
 local inflate_pack_object = inflate.inflate_pack_object
+local chunks_to_string    = inflate.chunks_to_string
 
 local M = {}
 
@@ -288,6 +289,7 @@ function M.parse_packfile(pack_data, git_dir)
 
       local inflate_start_pos = pos
       local delta_data, next_pos = inflate_pack_object(pack_data, pos, size)
+      delta_data = chunks_to_string(delta_data)
       pos = next_pos
 
       dbg("parse_packfile: OFS_DELTA inflated delta=%d bytes, compressed_span=%d bytes",
@@ -312,6 +314,7 @@ function M.parse_packfile(pack_data, git_dir)
 
       local inflate_start_pos = pos
       local delta_data, next_pos = inflate_pack_object(pack_data, pos, size)
+      delta_data = chunks_to_string(delta_data)
       pos = next_pos
 
       dbg("parse_packfile: REF_DELTA inflated delta=%d bytes, compressed_span=%d bytes",
@@ -333,6 +336,7 @@ function M.parse_packfile(pack_data, git_dir)
       else
         local inflate_start_pos = pos
         local content, next_pos = inflate_pack_object(pack_data, pos, size)
+        content = chunks_to_string(content)
         pos = next_pos
 
         dbg("parse_packfile: %s inflated content=%d bytes compressed_span=%d bytes",
