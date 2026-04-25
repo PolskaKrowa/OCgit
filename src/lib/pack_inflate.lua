@@ -231,31 +231,59 @@ function M.inflate_zlib_slice(data, pos, expected_size)
     return nil, nil
   end
 
+  -- ── bound the input slice ──────────────────────────────────────────
+  -- The compressed stream can't exceed expected_size + small zlib overhead,
+  -- so cap the input the same way make_inflater / bsearch already do.
+  local input_hi    = math.min(math.max(expected_size + 128, 512), #data - pos + 1)
+  local input_slice = data:sub(pos, pos + input_hi - 1)
+
   if D.DEBUG_INFLATE then
-    dbg("inflate_zlib_slice: pos=%d expected_size=%d (single-pass, cpu)",
-        pos, expected_size)
-    dbg_hex("inflate_zlib_slice: zlib header bytes", data:sub(pos, pos + 5), 6)
+    dbg("inflate_zlib_slice: pos=%d expected_size=%d input_slice_len=%d (cpu)",
+        pos, expected_size, #input_slice)
+    dbg_hex("inflate_zlib_slice: zlib header bytes", input_slice:sub(1, 6), 6)
   end
 
-  local out        = {}
+  -- ── chunked output buffering ───────────────────────────────────────
+  -- Accumulate into a small fixed-size buffer and flush it as a single
+  -- concatenated chunk, keeping peak live-object count down to CHUNK_SIZE + a
+  -- handful of chunk strings.
+  local CHUNK_SIZE = 512        -- tune down further if RAM is extremely tight
+  local chunks     = {}
+  local buf        = {}
+  local buf_n      = 0
   local bytes_read = 0
 
   local ok, err = pcall(function()
     M.cpu_deflate.inflate_zlib({
-      input  = data:sub(pos),   -- feed the whole tail; libdeflate stops at stream end
-      output = function(byte) out[#out + 1] = string.char(byte) end,
-      -- libdeflate calls this when it finishes, reporting how many input bytes
-      -- it consumed (including the 2-byte header and 4-byte Adler-32 trailer).
+      input  = input_slice,
+      output = function(byte)
+        buf_n       = buf_n + 1
+        buf[buf_n]  = string.char(byte)
+        if buf_n >= CHUNK_SIZE then
+          chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
+          buf_n = 0
+        end
+      end,
       bytes_read_callback = function(n) bytes_read = n end,
     })
   end)
+
+  -- Release the (now large) input slice as early as possible
+  input_slice = nil
 
   if not ok then
     dbg("inflate_zlib_slice: inflate_zlib error: %s", tostring(err))
     error("inflate_zlib_slice failed: " .. tostring(err))
   end
 
-  local content = table.concat(out)
+  -- Flush any remaining bytes in the partial buffer
+  if buf_n > 0 then
+    chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
+  end
+  buf = nil  -- release per-byte buffer before the final concat
+
+  local content = table.concat(chunks)
+  chunks = nil   -- release chunk list immediately after
 
   if D.DEBUG_INFLATE then
     dbg("inflate_zlib_slice: inflated %d bytes, bytes_read=%d next_pos=%d (expected_size=%d)",
@@ -265,9 +293,6 @@ function M.inflate_zlib_slice(data, pos, expected_size)
   assert(#content == expected_size,
     string.format("inflate_zlib_slice: size mismatch: got %d, expected %d", #content, expected_size))
 
-  -- bytes_read is 0 if the callback was never fired (older libdeflate builds
-  -- that don't support bytes_read_callback). Fall back to the binary search
-  -- in that case so we don't silently return a wrong next_pos.
   if bytes_read == 0 then
     dbg("inflate_zlib_slice: WARNING – bytes_read_callback not supported by this libdeflate build; " ..
         "falling back to binary search to find stream boundary")
