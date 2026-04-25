@@ -17,9 +17,8 @@ local sha1         = util.sha1
 local read_u32_be  = util.read_u32_be
 
 local inflate = require("pack_inflate")
-local safe_deflate        = inflate.safe_deflate
+local safe_deflate       = inflate.safe_deflate
 local inflate_pack_object = inflate.inflate_pack_object
-local chunks_to_string    = inflate.chunks_to_string
 
 local M = {}
 
@@ -127,7 +126,7 @@ function M.apply_delta(base, delta)
   -- Yield every 32 commands so the OC energy capacitor can recharge.
   -- apply_delta is pure Lua but large blobs can have thousands of COPY
   -- instructions; without yielding the capacitor drains mid-loop.
-  local YIELD_EVERY = 16
+  local YIELD_EVERY = 32
 
   while pos <= #delta do
     local cmd = delta:byte(pos); pos = pos + 1
@@ -289,7 +288,6 @@ function M.parse_packfile(pack_data, git_dir)
 
       local inflate_start_pos = pos
       local delta_data, next_pos = inflate_pack_object(pack_data, pos, size)
-      delta_data = chunks_to_string(delta_data)
       pos = next_pos
 
       dbg("parse_packfile: OFS_DELTA inflated delta=%d bytes, compressed_span=%d bytes",
@@ -314,7 +312,6 @@ function M.parse_packfile(pack_data, git_dir)
 
       local inflate_start_pos = pos
       local delta_data, next_pos = inflate_pack_object(pack_data, pos, size)
-      delta_data = chunks_to_string(delta_data)
       pos = next_pos
 
       dbg("parse_packfile: REF_DELTA inflated delta=%d bytes, compressed_span=%d bytes",
@@ -336,7 +333,6 @@ function M.parse_packfile(pack_data, git_dir)
       else
         local inflate_start_pos = pos
         local content, next_pos = inflate_pack_object(pack_data, pos, size)
-        content = chunks_to_string(content)
         pos = next_pos
 
         dbg("parse_packfile: %s inflated content=%d bytes compressed_span=%d bytes",
@@ -370,6 +366,12 @@ function M.parse_packfile(pack_data, git_dir)
 
   -- ── Delta resolution (multiple passes for chained deltas) ──────────────
   local pass_num = 0
+  -- How many apply_delta calls to run before a longer energy-recharge sleep.
+  -- Each call is far heavier than a single inflate command, so the threshold
+  -- is lower than apply_delta's own YIELD_EVERY (32 commands).
+  local RESOLVE_YIELD_EVERY = 8
+  local total_applied = 0   -- shared across all passes and both queues
+
   local function resolve_pass()
     pass_num = pass_num + 1
     local resolved = 0
@@ -383,7 +385,6 @@ function M.parse_packfile(pack_data, git_dir)
     -- OFS_DELTA
     local remaining_ofs = {}
     for _, entry in ipairs(ofs_queue) do
-      os.sleep(0)
       local base_sha = off_to_sha[entry.base_offset]
       local base_obj = base_sha and objects[base_sha]
 
@@ -418,7 +419,14 @@ function M.parse_packfile(pack_data, git_dir)
 
         M.write_object(git_dir, sha, type_name, content)
         print(string.format("  [%s/ofs_delta] %s", type_name, sha))
-        resolved = resolved + 1
+        resolved      = resolved + 1
+        total_applied = total_applied + 1
+        if total_applied % RESOLVE_YIELD_EVERY == 0 then
+          dbg("resolve_pass #%d: energy yield after %d total apply_delta calls", pass_num, total_applied)
+          os.sleep(0.5)
+        else
+          os.sleep(0)
+        end
       else
         remaining_ofs[#remaining_ofs + 1] = entry
       end
@@ -428,7 +436,6 @@ function M.parse_packfile(pack_data, git_dir)
     -- REF_DELTA
     local remaining_ref = {}
     for _, entry in ipairs(ref_queue) do
-      os.sleep(0)
       local base_obj = objects[entry.base_sha]
 
       if not base_obj then
@@ -459,7 +466,14 @@ function M.parse_packfile(pack_data, git_dir)
 
         M.write_object(git_dir, sha, type_name, content)
         print(string.format("  [%s/ref_delta] %s", type_name, sha))
-        resolved = resolved + 1
+        resolved      = resolved + 1
+        total_applied = total_applied + 1
+        if total_applied % RESOLVE_YIELD_EVERY == 0 then
+          dbg("resolve_pass #%d: energy yield after %d total apply_delta calls", pass_num, total_applied)
+          os.sleep(0.5)
+        else
+          os.sleep(0)
+        end
       else
         remaining_ref[#remaining_ref + 1] = entry
       end
