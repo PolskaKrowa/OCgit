@@ -247,11 +247,14 @@ function M.inflate_zlib_slice(data, pos, expected_size)
   end
 
   -- ── Chunked output buffering ──────────────────────────────────────────────
-  -- Accumulate into a fixed-size buffer rather than one string.char() per byte.
-  local CHUNK_SIZE = 2048
+  -- Bytes are flushed into fixed-size chunks.  We never call table.concat over
+  -- the full output; callers receive the chunks table directly and call
+  -- M.chunks_to_string() only when they truly need a single string.
+  local CHUNK_SIZE = 8192
   local chunks     = {}
   local buf        = {}
   local buf_n      = 0
+  local total_len  = 0   -- tracked in the callback; avoids #string on huge data
   local bytes_read = 0
 
   local ok, err = pcall(function()
@@ -260,6 +263,7 @@ function M.inflate_zlib_slice(data, pos, expected_size)
       output = function(byte)
         buf_n      = buf_n + 1
         buf[buf_n] = string.char(byte)
+        total_len  = total_len + 1
         if buf_n >= CHUNK_SIZE then
           chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
           buf_n = 0
@@ -269,7 +273,7 @@ function M.inflate_zlib_slice(data, pos, expected_size)
     })
   end)
 
-  input_slice = nil  -- release before building content string
+  input_slice = nil  -- release compressed input before any further allocation
 
   if not ok then
     dbg("inflate_zlib_slice: inflate_zlib error: %s", tostring(err))
@@ -280,26 +284,15 @@ function M.inflate_zlib_slice(data, pos, expected_size)
     chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
   end
   buf = nil
-  collectgarbage("collect")   -- free Lua garbage before the big alloc
 
-  local concat_ok, content = pcall(table.concat, chunks)
-  chunks = nil
-  collectgarbage("collect")
-
-  if not concat_ok then
-    error(string.format(
-      "inflate_zlib_slice: out of memory assembling %d-byte result " ..
-      "(expected_size=%d). Use a machine with more RAM or split the object.",
-      expected_size, expected_size))
-  end
-
+  -- Size check uses the counter, not #string – no full concat needed here.
   if D.DEBUG_INFLATE then
     dbg("inflate_zlib_slice: inflated %d bytes, bytes_read=%d next_pos=%d (expected_size=%d)",
-        #content, bytes_read, pos + bytes_read, expected_size)
+        total_len, bytes_read, pos + bytes_read, expected_size)
   end
 
-  assert(#content == expected_size,
-    string.format("inflate_zlib_slice: size mismatch: got %d, expected %d", #content, expected_size))
+  assert(total_len == expected_size,
+    string.format("inflate_zlib_slice: size mismatch: got %d, expected %d", total_len, expected_size))
 
   -- ── Reliability guards ────────────────────────────────────────────────────
   -- Fall back to binary search if:
@@ -309,7 +302,9 @@ function M.inflate_zlib_slice(data, pos, expected_size)
   --       the stream and next_pos would be wrong.
   if bytes_read == 0 then
     dbg("inflate_zlib_slice: WARNING – bytes_read_callback not supported; falling back to bsearch")
-    return M.inflate_zlib_slice_bsearch(data, pos, expected_size, content)
+    -- chunks may already hold the correct output, but bsearch discards known_chunks
+    -- and re-inflates cleanly, so pass nil to make the discard explicit.
+    return M.inflate_zlib_slice_bsearch(data, pos, expected_size, nil)
   end
 
   if bytes_read >= input_hi then
@@ -323,7 +318,8 @@ function M.inflate_zlib_slice(data, pos, expected_size)
     return M.inflate_zlib_slice_bsearch(data, pos, expected_size, nil)
   end
 
-  return content, pos + bytes_read
+  -- Return the chunks table; callers use M.chunks_to_string() if needed.
+  return chunks, pos + bytes_read
 end
 
 --------------------------------------------------------------------------------
@@ -331,52 +327,73 @@ end
 --
 -- Identical to the old inflate_zlib_slice: binary-searches for the shortest
 -- input prefix that produces exactly expected_size bytes of output.
--- `known_content` is the already-inflated result so we skip re-inflating hi.
+-- `known_chunks` is accepted for API compatibility but is always discarded;
+-- bsearch re-inflates cleanly from scratch.
 --------------------------------------------------------------------------------
-function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_content)
+function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_chunks)
   -- Use the same generous ceiling as inflate_zlib_slice so that if we arrive
   -- here via the bytes_read >= input_hi guard, hi is large enough to cover
   -- the full stream.
-  local available    = #data - pos + 1
-  local lo           = 6
-  local hi           = math.min(math.max(expected_size + 512, 1024), available)
-  local best_content = nil   -- do NOT pre-seed with known_content; it may be
-  local best_len     = hi    -- from a truncated inflate and therefore wrong.
-                             -- The bsearch will re-inflate hi on the first step.
+  local available   = #data - pos + 1
+  local lo          = 6
+  local hi          = math.min(math.max(expected_size + 512, 1024), available)
+  local best_chunks = nil   -- do NOT pre-seed with known_chunks; it may be
+  local best_len    = hi    -- from a truncated inflate and therefore wrong.
+                            -- The bsearch will re-inflate hi on the first step.
 
   if D.DEBUG_INFLATE then
-    dbg("inflate_zlib_slice_bsearch: pos=%d expected_size=%d search_range=[%d,%d] known_content=%s",
-        pos, expected_size, lo, hi, known_content and "provided (discarded)" or "nil")
+    dbg("inflate_zlib_slice_bsearch: pos=%d expected_size=%d search_range=[%d,%d] known_chunks=%s",
+        pos, expected_size, lo, hi, known_chunks and "provided (discarded)" or "nil")
   end
 
-  -- Verify the upper bound before searching (same as make_inflater's verify phase).
-  -- This also gives us the correct best_content for hi regardless of how we arrived here.
-  do
-    local out = {}
-    local ok  = pcall(function()
+  -- ── Local helper: inflate a slice into a chunks table ────────────────────
+  -- Returns chunks_table, total_len.  chunks_table is nil on inflate error.
+  -- Uses 8 KB flush buckets to keep per-byte Lua object overhead low.
+  -- Critically: never calls table.concat over the *full* output, so memory
+  -- peak is bounded by one 8 KB bucket plus the chunks table.
+  local CHUNK = 8192
+  local function inflate_to_chunks(slice)
+    local ch    = {}
+    local buf   = {}
+    local buf_n = 0
+    local total = 0
+    local ok = pcall(function()
       M.cpu_deflate.inflate_zlib({
-        input  = data:sub(pos, pos + hi - 1),
-        output = function(byte) out[#out + 1] = string.char(byte) end,
+        input  = slice,
+        output = function(byte)
+          buf_n = buf_n + 1
+          buf[buf_n] = string.char(byte)
+          total = total + 1
+          if buf_n >= CHUNK then
+            ch[#ch + 1] = table.concat(buf, "", 1, buf_n)
+            buf_n = 0
+          end
+        end,
       })
     end)
-    local c = ok and table.concat(out) or nil
-    if c and #c == expected_size then
-      best_content = c
+    if buf_n > 0 then
+      ch[#ch + 1] = table.concat(buf, "", 1, buf_n)
+    end
+    if not ok then return nil, 0 end
+    return ch, total
+  end
+
+  -- ── Verify the upper bound before searching ───────────────────────────────
+  -- Same as make_inflater's verify phase; gives us the correct best_chunks for
+  -- hi regardless of how we arrived here.
+  do
+    local ch, total = inflate_to_chunks(data:sub(pos, pos + hi - 1))
+    if ch and total == expected_size then
+      best_chunks = ch
     else
       -- hi is still not large enough; fall back to the full remaining slice.
       dbg("inflate_zlib_slice_bsearch: WARNING – hi=%d still too small, using full available=%d", hi, available)
       hi = available
-      out = {}
-      pcall(function()
-        M.cpu_deflate.inflate_zlib({
-          input  = data:sub(pos, pos + hi - 1),
-          output = function(byte) out[#out + 1] = string.char(byte) end,
-        })
-      end)
-      best_content = table.concat(out)
-      assert(#best_content == expected_size,
+      ch, total = inflate_to_chunks(data:sub(pos, pos + hi - 1))
+      assert(ch and total == expected_size,
         string.format("inflate_zlib_slice_bsearch: even full slice failed: got %d, expected %d",
-          #best_content, expected_size))
+          total, expected_size))
+      best_chunks = ch
     end
   end
 
@@ -385,26 +402,20 @@ function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_content)
     os.sleep(0)
     step = step + 1
     local mid = math.floor((lo + hi) / 2)
-    local out  = {}
-    local ok   = pcall(function()
-      M.cpu_deflate.inflate_zlib({
-        input  = data:sub(pos, pos + mid - 1),
-        output = function(byte) out[#out + 1] = string.char(byte) end,
-      })
-    end)
-    local c = ok and table.concat(out) or nil
-    if c and #c == expected_size then
+    local ch, total = inflate_to_chunks(data:sub(pos, pos + mid - 1))
+    if ch and total == expected_size then
       if D.DEBUG_INFLATE then
         dbg("inflate_zlib_slice_bsearch[step %d]: mid=%d OK, narrowing hi", step, mid)
       end
-      best_content = c
-      best_len     = mid
-      hi           = mid
+      best_chunks = ch    -- discard previous winner; GC will free it
+      best_len    = mid
+      hi          = mid
     else
       if D.DEBUG_INFLATE then
         dbg("inflate_zlib_slice_bsearch[step %d]: mid=%d failed, raising lo", step, mid)
       end
       lo = mid + 1
+      -- ch is unreferenced here and will be collected
     end
   end
 
@@ -413,8 +424,19 @@ function M.inflate_zlib_slice_bsearch(data, pos, expected_size, known_content)
         step, best_len, pos + best_len)
   end
 
-  assert(best_content, "inflate_zlib_slice_bsearch: failed to find stream boundary")
-  return best_content, pos + best_len
+  assert(best_chunks, "inflate_zlib_slice_bsearch: failed to find stream boundary")
+  return best_chunks, pos + best_len
+end
+
+--------------------------------------------------------------------------------
+-- chunks_to_string
+--
+-- Materialise a chunks table into a single Lua string.  Call this only when
+-- you genuinely need one contiguous string (e.g. hashing, comparison).
+-- For large objects, prefer iterating over the chunks table directly.
+--------------------------------------------------------------------------------
+function M.chunks_to_string(chunks)
+  return table.concat(chunks)
 end
 
 --------------------------------------------------------------------------------
@@ -422,7 +444,10 @@ end
 --
 -- Public entry point: inflates one pack object starting at `pos` in `data`,
 -- dispatching to either the cpu or datacard path.
--- Returns: content (string), next_pos (integer)
+-- Returns: chunks (table of strings), next_pos (integer)
+--
+-- The returned `chunks` table avoids a single large allocation.  Call
+-- M.chunks_to_string(chunks) if you need one contiguous string.
 --------------------------------------------------------------------------------
 function M.inflate_pack_object(data, pos, expected_size)
   if D.DEBUG_INFLATE then
@@ -434,15 +459,13 @@ function M.inflate_pack_object(data, pos, expected_size)
     if D.DEBUG_INFLATE then
       dbg("inflate_pack_object: using cpu_deflate path (inflate_zlib_slice)")
     end
-    local content, next_pos = M.inflate_zlib_slice(data, pos, expected_size)
-    assert(content, "inflate failed: cpu inflater returned no output")
-    assert(#content == expected_size,
-      string.format("inflate_at: expected %d, got %d", expected_size, #content))
+    local chunks, next_pos = M.inflate_zlib_slice(data, pos, expected_size)
+    assert(chunks, "inflate failed: cpu inflater returned no output")
     if D.DEBUG_INFLATE then
       dbg("inflate_pack_object: cpu path done, next_pos=%d consumed=%d bytes",
           next_pos, next_pos - pos)
     end
-    return content, next_pos
+    return chunks, next_pos
   end
 
   if D.DEBUG_INFLATE then
@@ -466,7 +489,9 @@ function M.inflate_pack_object(data, pos, expected_size)
         dbg("inflate_pack_object: datacard path done after %d loops, next_pos=%d consumed=%d bytes",
             loop_count, out.next_pos, out.next_pos - pos)
       end
-      return out.data, out.next_pos
+      -- Wrap the datacard string in a single-element chunks table so the
+      -- return type is uniform with the cpu path.
+      return {out.data}, out.next_pos
     end
   end
 end
