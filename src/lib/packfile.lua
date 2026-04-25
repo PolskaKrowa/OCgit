@@ -355,7 +355,6 @@ function M.parse_packfile(pack_data, git_dir)
         end
 
         M.write_object(git_dir, sha, type_name, content)
-        print(string.format("  [%s] %s", type_name, sha))
         type_counts[type_name] = (type_counts[type_name] or 0) + 1
       end
     end
@@ -422,7 +421,6 @@ function M.parse_packfile(pack_data, git_dir)
         off_to_sha[entry.obj_offset] = sha
 
         M.write_object(git_dir, sha, type_name, content)
-        print(string.format("  [%s/ofs_delta] %s", type_name, sha))
         resolved      = resolved + 1
         total_applied = total_applied + 1
         if total_applied % RESOLVE_YIELD_EVERY == 0 then
@@ -469,7 +467,6 @@ function M.parse_packfile(pack_data, git_dir)
         off_to_sha[entry.obj_offset] = sha
 
         M.write_object(git_dir, sha, type_name, content)
-        print(string.format("  [%s/ref_delta] %s", type_name, sha))
         resolved      = resolved + 1
         total_applied = total_applied + 1
         if total_applied % RESOLVE_YIELD_EVERY == 0 then
