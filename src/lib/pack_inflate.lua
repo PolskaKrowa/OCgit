@@ -280,9 +280,11 @@ function M.inflate_zlib_slice(data, pos, expected_size)
     chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
   end
   buf = nil
+  collectgarbage("collect")  -- free buf memory before allocating content string
 
   local content = table.concat(chunks)
   chunks = nil
+  collectgarbage("collect")  -- free chunks table after concat
 
   if D.DEBUG_INFLATE then
     dbg("inflate_zlib_slice: inflated %d bytes, bytes_read=%d next_pos=%d (expected_size=%d)",
