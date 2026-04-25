@@ -145,7 +145,7 @@ Issues and pull requests are welcome! If you run into a repository that fails to
 Licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for the full text.
 
 ```
-Copyright 2024 PolskaKrowa
+Copyright 2026 PolskaKrowa
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
