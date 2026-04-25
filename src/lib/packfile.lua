@@ -7,11 +7,22 @@
 local component = require("component")
 local data_comp = component.data
 
-local D = require("debug")
-local dbg         = D.dbg
-local dbg_hex     = D.dbg_hex
-local dbg_enter   = D.dbg_enter
-local dbg_leave   = D.dgb_leave
+local filesystem = require("filesystem")
+ 
+local D       = require("debug")
+local dbg       = D.dbg
+local dbg_hex   = D.dbg_hex
+local dbg_enter = D.dbg_enter
+local dbg_leave = D.dbg_leave
+ 
+local util    = require("util")
+local sha1         = util.sha1
+local read_u32_be  = util.read_u32_be
+ 
+local inflate = require("pack_inflate")
+local safe_deflate        = inflate.safe_deflate
+local inflate_pack_object = inflate.inflate_pack_object
+local chunks_to_string    = inflate.chunks_to_string
 
 local M = {}
 
