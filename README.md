@@ -9,7 +9,9 @@ OCgit is a pure-Lua Git client for [OpenComputers](https://github.com/MightyPira
 ## Features
 
 - **`OCgit clone`** — clones any public HTTPS Git repository
+- **`OCgit pull`** — fetches new commits and updates the working tree of a previously cloned repo
 - Git Smart HTTP protocol v2 (with automatic v1 fallback)
+- Thin delta packs on pull (only the objects you're missing are downloaded)
 - Packfile parsing with OFS and REF delta resolution
 - Pure-Lua zlib inflate (via `deflate.lua`) with automatic fallback to the OpenComputers data card
 - Coloured terminal output with graceful monochrome degradation
@@ -57,7 +59,8 @@ The installer will:
 
 ```sh
 OCgit clone <url> [directory]
-OCgit help [command]
+OCgit pull  [directory]
+OCgit help  [command]
 ```
 
 ### Examples
@@ -69,8 +72,14 @@ OCgit clone https://github.com/user/repo
 # Clone into a specific directory
 OCgit clone https://github.com/user/repo  myproject
 
+# Pull the latest changes into the repo in the current directory
+OCgit pull
+
+# Pull the latest changes into a specific repo directory
+OCgit pull myproject
+
 # Get help on a specific command
-OCgit help clone
+OCgit help pull
 ```
 
 ---
@@ -84,6 +93,7 @@ OCgit/
     ├── OCgit.lua        # CLI entry point  →  /bin/OCgit.lua
     └── lib/
         ├── clone.lua        # Top-level clone orchestration
+        ├── pull.lua         # Top-level pull orchestration
         ├── protocol.lua     # Git Smart HTTP (discover refs, fetch pack)
         ├── packfile.lua     # Packfile parser & delta application
         ├── pack_inflate.lua # zlib inflate (cpu + data card paths)
@@ -117,20 +127,35 @@ Set any of these to `false` to silence that layer. For normal use it's recommend
 
 ## How It Works
 
+### `clone`
+
 1. **Discover refs** — sends a `ls-refs` command over Smart HTTP to enumerate the remote's branches
 2. **Fetch packfile** — sends a `fetch` command requesting the HEAD commit; the server streams a packfile back over sideband channel 1
 3. **Parse packfile** — unpacks every object (commits, trees, blobs) and resolves OFS/REF deltas in-order
 4. **Write loose objects** — each object is zlib-compressed and written to `.git/objects/xx/yyyy…`
-5. **Checkout** — walks the root tree recursively, writing blob contents to the working directory
+5. **Write metadata** — writes `.git/HEAD`, `.git/refs/heads/<branch>`, `.git/refs/remotes/origin/<branch>`, and `.git/config` (so `pull` knows where to fetch from)
+6. **Checkout** — walks the root tree recursively, writing blob contents to the working directory
+
+### `pull`
+
+1. **Read local state** — reads `.git/HEAD` (current branch), `.git/refs/heads/<branch>` (local commit SHA), and `.git/config` (remote `origin` URL)
+2. **Discover remote refs** — same `ls-refs` v2 command used by `clone`
+3. **Short-circuit** — if the remote tip equals the local tip, prints `Already up to date.` and exits
+4. **Fetch a thin delta pack** — sends a `fetch` command advertising the local SHA as a `have` line, so the server omits objects you already have
+5. **Parse packfile** — same parser as `clone`; new loose objects are written to `.git/objects/`
+6. **Sync the working tree** — walks the new tree, overwriting every blob with its latest content, and deletes files that vanished on the remote (using the old tree as the deletion set)
+7. **Update refs** — bumps `.git/refs/heads/<branch>` and `.git/refs/remotes/origin/<branch>` to the new tip
 
 ---
 
 ## Limitations
 
-- **Read-only** — only `clone` is implemented. There is no `commit`, `push`, or `pull`.
+- **Read-only** — only `clone` and `pull` are implemented. There is no `commit`, `push`, `add`, `branch`, or `merge`.
 - **Public repos only** — no authentication support.
 - **HTTPS only** — SSH is not supported by the OpenComputers internet card.
 - **Single branch** — checks out `main` or `master` (whichever exists); other branches are not yet selectable.
+- **Fast-forward only** — `pull` does not perform a 3-way merge. If the local tip is not an ancestor of the remote tip (e.g. you have local commits), the new tree is still checked out, overwriting any local changes. There is no index, so uncommitted local file edits will also be overwritten.
+- **Submodule / LFS** — not supported.
 
 ---
 

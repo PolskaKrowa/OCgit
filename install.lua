@@ -73,6 +73,7 @@ local FILES = {
   -- OCgit files
   { url = OCGIT_BASE .. "src/OCgit.lua",            dest = "/bin/OCgit.lua"          },
   { url = OCGIT_BASE .. "src/lib/clone.lua",         dest = "/lib/clone.lua"          },
+  { url = OCGIT_BASE .. "src/lib/pull.lua",          dest = "/lib/pull.lua"           },
   { url = OCGIT_BASE .. "src/lib/checkout.lua",      dest = "/lib/checkout.lua"       },
   { url = OCGIT_BASE .. "src/lib/packfile.lua",      dest = "/lib/packfile.lua"       },
   { url = OCGIT_BASE .. "src/lib/pack_inflate.lua",  dest = "/lib/pack_inflate.lua"   },

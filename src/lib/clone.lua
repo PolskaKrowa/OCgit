@@ -137,6 +137,37 @@ function M.clone(remote_url, target_dir)
   ref_f:write(head_sha .. "\n")
   ref_f:close()
 
+  -- 6b. Write .git/config so that 'pull' knows where to fetch from.
+  --     We also persist the remote-tracking ref so the layout matches a
+  --     real git repository.
+  local config_path = git_dir .. "/config"
+  dbg("clone: writing .git/config (remote.origin.url=%s)", remote_url)
+  local config_f, config_err = io.open(config_path, "w")
+  assert(config_f, "Failed to open " .. config_path .. ": " .. tostring(config_err))
+  config_f:write("[core]\n")
+  config_f:write("\trepositoryformatversion = 0\n")
+  config_f:write("\tfilemode = false\n")
+  config_f:write("\tbare = false\n")
+  config_f:write("[remote \"origin\"]\n")
+  config_f:write("\turl = " .. remote_url .. "\n")
+  config_f:write("\tfetch = +refs/heads/*:refs/remotes/origin/*\n")
+  config_f:write("[branch \"" .. branch .. "\"]\n")
+  config_f:write("\tremote = origin\n")
+  config_f:write("\tmerge = " .. head_ref .. "\n")
+  config_f:close()
+
+  -- Remote-tracking ref: refs/remotes/origin/<branch>
+  local remote_ref_dir = git_dir .. "/refs/remotes/origin"
+  if not filesystem.isDirectory(remote_ref_dir) then
+    filesystem.makeDirectory(remote_ref_dir)
+  end
+  local remote_ref_path = remote_ref_dir .. "/" .. branch
+  local rr_f = io.open(remote_ref_path, "w")
+  if rr_f then
+    rr_f:write(head_sha .. "\n")
+    rr_f:close()
+  end
+
   -- 7. Checkout working tree
   local commit_obj = objects[head_sha]
   if not commit_obj then

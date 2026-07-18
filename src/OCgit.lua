@@ -199,6 +199,66 @@ Requires: internet card, data card (tier 2+)]],
 }
 
 -------------------------------------------------------------------------------
+-- Command: pull
+-------------------------------------------------------------------------------
+COMMANDS["pull"] = {
+  short_desc = "Fetch and merge from the remote",
+  long_desc  = [[Fetch new commits from the remote repository configured in
+.git/config and update the current branch's working tree.
+
+Pull is the OCgit equivalent of 'git pull' on a branch that was previously
+cloned with 'OCgit clone'.  Only objects reachable from the new remote tip
+but NOT from your local tip are downloaded (a thin delta pack), so updating
+a large repo is fast.
+
+What it does, in order:
+  1. Reads .git/HEAD to determine the current branch
+  2. Reads .git/refs/heads/<branch> for the local commit SHA
+  3. Reads .git/config for the remote 'origin' URL
+  4. Discovers the remote's refs (ls-refs over Smart HTTP v2)
+  5. If local == remote: prints "Already up to date." and exits
+  6. Sends a 'fetch' request advertising the local SHA as a 'have'
+  7. Parses the returned thin packfile into .git/objects/
+  8. Walks the new tree: writes/overwrites every file
+  9. Deletes files that were present in the old tree but are gone on remote
+ 10. Updates .git/refs/heads/<branch> to the new tip
+
+Requires: internet card, data card (tier 2+)]],
+  usage    = "OCgit pull [directory]",
+  examples = {
+    "OCgit pull",
+    "OCgit pull myproject",
+  },
+  run = function(args)
+    local target = args[1]
+
+    if not component.isAvailable("internet") then
+      die("no internet card detected – please install one")
+    end
+
+    print_banner()
+    println_color(colors.cyan, "Pulling updates")
+    if target then
+      info("into directory: " .. target)
+    end
+    io.write("\n")
+
+    local ok, pull = pcall(require, "pull")
+    if not ok then
+      die("could not load pull.lua – make sure it is on your path\n       " .. tostring(pull))
+    end
+
+    local pull_ok, err = pcall(pull.pull, target)
+    if not pull_ok then
+      die(tostring(err))
+    end
+
+    io.write("\n")
+    success("Pull complete")
+  end,
+}
+
+-------------------------------------------------------------------------------
 -- Dispatch
 -------------------------------------------------------------------------------
 local raw_args = { ... }   -- OpenOS passes CLI args via vararg

@@ -9,6 +9,9 @@ local http_request    = util.http_request
 local pkt_line        = util.pkt_line
 local parse_pkt_lines = util.parse_pkt_lines
 
+local D   = require("debug")
+local dbg = D.dbg
+
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -80,8 +83,13 @@ end
 
 --------------------------------------------------------------------------------
 -- Step 2: Request the Packfile (fetch)
+--
+-- want_sha    – the SHA the client wants to fetch (the new tip)
+-- have_shas   – optional table/array of SHAs the client already has; the
+--                server will omit objects reachable from these (delta pack).
+--                Empty/nil means "fetch everything" (clone-style).
 --------------------------------------------------------------------------------
-function M.negotiate_packfile(remote_url, want_sha)
+function M.negotiate_packfile(remote_url, want_sha, have_shas)
   local url = remote_url .. "/git-upload-pack"
   local headers = {
     ["Git-Protocol"]  = "version=2",
@@ -89,17 +97,33 @@ function M.negotiate_packfile(remote_url, want_sha)
     ["Accept"]        = "application/x-git-upload-pack-result",
   }
 
-  local payload = table.concat({
+  local payload_parts = {
     pkt_line("command=fetch\n"),
     pkt_line("DELIM"),
     pkt_line("thin-pack\n"),
     pkt_line("ofs-delta\n"),
+    pkt_line("no-progress\n"),
     pkt_line("want " .. want_sha .. "\n"),
-    pkt_line("done\n"),
-    pkt_line("FLUSH"),
-  })
+  }
+
+  -- Advertise every object the client already has so the server can build
+  -- a minimal delta pack.  In protocol v2 the server treats each 'have'
+  -- as an independent tip it may use for delta bases / reachability pruning.
+  if have_shas then
+    for _, sha in ipairs(have_shas) do
+      payload_parts[#payload_parts + 1] = pkt_line("have " .. sha .. "\n")
+    end
+  end
+
+  payload_parts[#payload_parts + 1] = pkt_line("done\n")
+  payload_parts[#payload_parts + 1] = pkt_line("FLUSH")
+
+  local payload = table.concat(payload_parts)
 
   print("Requesting packfile for " .. want_sha .. "...")
+  if have_shas and #have_shas > 0 then
+    dbg("negotiate_packfile: sending %d 'have' line(s) for delta fetch", #have_shas)
+  end
   return http_request(url, payload, headers)
 end
 
