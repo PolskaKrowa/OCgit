@@ -59,14 +59,42 @@ end
 
 --------------------------------------------------------------------------------
 -- write_object
--- No-op stub kept so that parse_packfile call-sites compile unchanged.
--- Objects are held in RAM; checkout will call write_object_now on-demand
--- for any object it cannot find in the in-memory table.
--- Flushing every object via safe_deflate() during parsing causes energy
--- starvation on the datacard (hundreds of calls back-to-back).
+-- Persist one loose object to .git/objects/, with energy-aware throttling.
+--
+-- This used to be a no-op stub (objects were held in RAM only).  That works
+-- for clone — the in-RAM table is complete — but as soon as the clone
+-- process exits, every object is gone.  A subsequent `pull` then fails
+-- because walk_tree cannot find the old tree's subtrees on disk.
+--
+-- We now persist every object via write_object_now, skipping ones that are
+-- already on disk.  Between writes we sleep so the data card's capacitor
+-- can recharge (each deflate call is energy-expensive on the data card;
+-- with cpu_deflate the sleep is essentially free, but we still yield to
+-- keep the OC event loop alive and avoid "too long without yielding").
 --------------------------------------------------------------------------------
+local _write_throttle_count = 0
+
 function M.write_object(git_dir, sha, type_name, content)
-  dbg("write_object: deferred (RAM-only) %s %s", type_name, sha)
+  -- write_object_now itself skips if the object is already on disk, but we
+  -- want to know whether we actually wrote so we can throttle appropriately.
+  local obj_path = git_dir .. "/objects/" .. sha:sub(1, 2) .. "/" .. sha:sub(3)
+  if filesystem.exists(obj_path) then
+    dbg("write_object: skipping %s (already on disk)", sha)
+    return
+  end
+
+  M.write_object_now(git_dir, sha, type_name, content)
+
+  _write_throttle_count = _write_throttle_count + 1
+  -- Every 4th write, sleep longer to let the data card recharge.
+  -- Intermediate writes still yield via os.sleep(0) so the OC event loop
+  -- stays alive.
+  if _write_throttle_count % 4 == 0 then
+    dbg("write_object: throttle yield after %d writes", _write_throttle_count)
+    os.sleep(0.5)
+  else
+    os.sleep(0)
+  end
 end
 
 --------------------------------------------------------------------------------

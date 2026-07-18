@@ -278,9 +278,37 @@ function M.pull(target_dir)
     return
   end
 
-  -- 6. Fetch a delta packfile (advertise local_sha as a 'have')
-  print(string.format("Fetching updates %s → %s ...", local_sha:sub(1,7), remote_sha:sub(1,7)))
-  local response = negotiate_packfile(remote_url, remote_sha, { local_sha })
+  -- 6. Decide between a delta fetch and a full fetch.
+  --
+  -- A delta fetch advertises local_sha as a 'have' so the server omits
+  -- objects the client already has.  This ONLY works if those objects are
+  -- actually present on disk (or in RAM) — otherwise walk_tree will fail
+  -- on the first unchanged subtree that isn't in the delta pack.
+  --
+  -- Legacy clones (created before this fix) did not persist objects to
+  -- disk during clone, so we detect that case by trying to read the local
+  -- commit object from disk.  If it's missing, we do a full fetch (no
+  -- 'have' lines), which causes the server to send every object reachable
+  -- from remote_sha.  This is wasteful (it's effectively a re-clone) but
+  -- it's the only way to recover a legacy clone without re-running clone.
+  -- After this pull, .git/objects/ will be populated and subsequent pulls
+  -- will use the cheap delta path.
+  local local_commit_data = read_loose_object(git_dir, local_sha)
+  local have_shas
+  if local_commit_data then
+    print(string.format("Fetching updates %s → %s ...",
+        local_sha:sub(1,7), remote_sha:sub(1,7)))
+    dbg("pull: local commit %s found on disk – using delta fetch", local_sha)
+    have_shas = { local_sha }
+  else
+    print(string.format("Local state incomplete (objects missing from disk);"))
+    print(string.format("doing a full fetch from %s ...", remote_sha:sub(1,7)))
+    print(string.format("(This is a one-time cost – future pulls will be fast.)"))
+    dbg("pull: local commit %s NOT on disk – using full fetch", local_sha)
+    have_shas = nil
+  end
+
+  local response = negotiate_packfile(remote_url, remote_sha, have_shas)
   dbg("pull: raw server response=%d bytes", #response)
 
   -- 7. Demux sideband (may be empty if server says "already up to date"
@@ -325,7 +353,20 @@ function M.pull(target_dir)
 
   local old_files = {}
   if old_tree_sha then
-    old_files = collect_tree_files(git_dir, old_tree_sha, objects)
+    -- Try to walk the old tree to build the deletion set.  If any subtree
+    -- is missing (e.g. legacy clone that didn't persist objects, OR a
+    -- subtree that was deleted on the remote and thus not in the full
+    -- fetch), skip the deletion step gracefully rather than crashing.
+    -- The NEW tree walk (below) is independent and will still succeed.
+    local ok_old, result_or_err = pcall(collect_tree_files, git_dir, old_tree_sha, objects)
+    if ok_old then
+      old_files = result_or_err
+    else
+      print("WARNING: could not walk old tree (" .. tostring(result_or_err) .. ")")
+      print("         file deletions will not be applied this run.")
+      print("         (This is expected for legacy clones; future pulls will work fully.)")
+      old_files = {}
+    end
   end
 
   local written   = 0
