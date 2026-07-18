@@ -71,8 +71,313 @@ local function silent_inflate_zlib(opts)
 
   if not ok then error(err, 2) end
 end
--- Wrap the data component calls, retrying on "not enough energy" errors.
+
 --------------------------------------------------------------------------------
+-- cpu_inflate_zlib_full  (cpu path, whole-buffer)
+--
+-- Unlike inflate_zlib_slice (which bounds its input to expected_size + slack
+-- because it's hunting for a stream boundary inside a larger packfile),
+-- safe_inflate is handed an exact, already-delimited zlib buffer with no
+-- known "expected size" ahead of time. So we just feed the whole thing to
+-- the pure-Lua inflater and collect everything it produces.
+--------------------------------------------------------------------------------
+local function cpu_inflate_zlib_full(bytes)
+  local CHUNK_SIZE = 8192
+  local chunks, buf, buf_n, total_len = {}, {}, 0, 0
+
+  local ok, err = pcall(function()
+    silent_inflate_zlib({
+      input  = bytes,
+      output = function(byte)
+        buf_n      = buf_n + 1
+        buf[buf_n] = string.char(byte)
+        total_len  = total_len + 1
+        if buf_n >= CHUNK_SIZE then
+          chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
+          buf_n = 0
+        end
+      end,
+    })
+  end)
+
+  if not ok then
+    error("cpu_inflate_zlib_full failed: " .. tostring(err))
+  end
+
+  if buf_n > 0 then
+    chunks[#chunks + 1] = table.concat(buf, "", 1, buf_n)
+  end
+
+  dbg("cpu_inflate_zlib_full: inflated %d bytes via pure-Lua inflater", total_len)
+  return table.concat(chunks)
+end
+
+--------------------------------------------------------------------------------
+-- Pure-Lua DEFLATE compressor (RFC 1951 / RFC 1950)
+--
+-- The optional third-party `deflate` module only exposes inflate_zlib, so
+-- there's no CPU-based deflate to fall back on for compression. This is a
+-- small self-contained implementation (LZ77 hash-chain matching + fixed
+-- Huffman coding, RFC 1951 §3.2.6) that needs no external dependency at all,
+-- used as the energy-free fallback for M.safe_deflate.
+--------------------------------------------------------------------------------
+do
+  local MOD_ADLER = 65521
+
+  local function adler32(data)
+    local a, b = 1, 0
+    local len = #data
+    local i = 1
+    while i <= len do
+      local chunk_end = math.min(i + 5551, len)
+      for j = i, chunk_end do
+        a = a + data:byte(j)
+        b = b + a
+      end
+      a = a % MOD_ADLER
+      b = b % MOD_ADLER
+      i = chunk_end + 1
+    end
+    return (b * 65536 + a) % 4294967296
+  end
+
+  -- ── Bit writer ──────────────────────────────────────────────────────────
+  -- DEFLATE packs ordinary fields LSB-first into the byte stream, but
+  -- Huffman codes are transmitted MSB-first. Both funnel through the same
+  -- per-bit push; they just pull bits out of the value in a different order.
+  local function new_bitwriter()
+    return { bytes = {}, cur = 0, nbits = 0 }
+  end
+
+  local function bw_push_bit(bw, bit)
+    bw.cur = bw.cur | (bit << bw.nbits)
+    bw.nbits = bw.nbits + 1
+    if bw.nbits == 8 then
+      bw.bytes[#bw.bytes + 1] = bw.cur
+      bw.cur = 0
+      bw.nbits = 0
+    end
+  end
+
+  local function bw_write_lsb(bw, value, nbits)
+    for i = 0, nbits - 1 do
+      bw_push_bit(bw, (value >> i) & 1)
+    end
+  end
+
+  local function bw_write_msb(bw, code, nbits)
+    for i = nbits - 1, 0, -1 do
+      bw_push_bit(bw, (code >> i) & 1)
+    end
+  end
+
+  local function bw_tostring(bw)
+    if bw.nbits > 0 then
+      bw.bytes[#bw.bytes + 1] = bw.cur
+      bw.cur, bw.nbits = 0, 0
+    end
+    local out, CH, n = {}, 4096, #bw.bytes
+    for i = 1, n, CH do
+      local j = math.min(i + CH - 1, n)
+      out[#out + 1] = string.char(table.unpack(bw.bytes, i, j))
+    end
+    return table.concat(out)
+  end
+
+  -- ── Fixed Huffman code tables (RFC 1951 §3.2.6) ─────────────────────────
+  local function fixed_lit_code(sym)
+    if sym <= 143 then
+      return 0x30 + sym, 8
+    elseif sym <= 255 then
+      return 0x190 + (sym - 144), 9
+    elseif sym <= 279 then
+      return 0x0 + (sym - 256), 7
+    else
+      return 0xC0 + (sym - 280), 8
+    end
+  end
+
+  local function fixed_dist_code(sym)
+    return sym, 5   -- fixed distance codes are always 5 bits, code == symbol
+  end
+
+  -- length (3..258) -> {sym, extra_bits, base_len}, precomputed per length
+  local LEN_SYM_BASE = {}
+  do
+    local LENGTH_TABLE = {
+      {3,0},{4,0},{5,0},{6,0},{7,0},{8,0},{9,0},{10,0},
+      {11,1},{13,1},{15,1},{17,1},
+      {19,2},{23,2},{27,2},{31,2},
+      {35,3},{43,3},{51,3},{59,3},
+      {67,4},{83,4},{99,4},{115,4},
+      {131,5},{163,5},{195,5},{227,5},
+      {258,0},
+    }
+    local sym = 257
+    for _, entry in ipairs(LENGTH_TABLE) do
+      local base, extra = entry[1], entry[2]
+      local count = (base == 258) and 1 or (1 << extra)
+      for v = base, base + count - 1 do
+        LEN_SYM_BASE[v] = { sym, extra, base }
+      end
+      sym = sym + 1
+    end
+  end
+
+  -- distance (1..32768) -> (sym, extra_bits, base), found via binary search
+  local DIST_TABLE = {
+    {1,0},{2,0},{3,0},{4,0},
+    {5,1},{7,1},
+    {9,2},{13,2},
+    {17,3},{25,3},
+    {33,4},{49,4},
+    {65,5},{97,5},
+    {129,6},{193,6},
+    {257,7},{385,7},
+    {513,8},{769,8},
+    {1025,9},{1537,9},
+    {2049,10},{3073,10},
+    {4097,11},{6145,11},
+    {8193,12},{12289,12},
+    {16385,13},{24577,13},
+  }
+  local function dist_sym_extra(dist)
+    local lo, hi = 1, #DIST_TABLE
+    while lo < hi do
+      local mid = (lo + hi + 1) // 2
+      if DIST_TABLE[mid][1] <= dist then lo = mid else hi = mid - 1 end
+    end
+    return lo - 1, DIST_TABLE[lo][2], DIST_TABLE[lo][1]
+  end
+
+  -- ── LZ77 match finder (hash chains over 3-byte sequences) ───────────────
+  local MIN_MATCH, MAX_MATCH, WINDOW_SIZE, MAX_CHAIN = 3, 258, 32768, 128
+
+  local function hash3(data, i)
+    local b1, b2, b3 = data:byte(i, i + 2)
+    return ((b1 * 33 + b2) * 33 + b3) % 32768
+  end
+
+  local function lz77_tokenize(data)
+    local n = #data
+    local tokens = {}
+    local head, prev = {}, {}
+    local i = 1
+
+    while i <= n do
+      local best_len, best_dist = 0, 0
+
+      if i + MIN_MATCH - 1 <= n then
+        local h = hash3(data, i)
+        local cand = head[h]
+        local chain = 0
+        local window_lo = math.max(1, i - WINDOW_SIZE)
+
+        while cand and cand >= window_lo and chain < MAX_CHAIN do
+          if best_len == 0 or (cand + best_len <= n and
+              data:byte(cand + best_len) == data:byte(i + best_len)) then
+            local max_possible = math.min(MAX_MATCH, n - i + 1)
+            local len = 0
+            while len < max_possible and data:byte(cand + len) == data:byte(i + len) do
+              len = len + 1
+            end
+            if len > best_len then
+              best_len, best_dist = len, i - cand
+              if best_len >= MAX_MATCH then break end
+            end
+          end
+          cand = prev[cand]
+          chain = chain + 1
+        end
+      end
+
+      if best_len >= MIN_MATCH then
+        tokens[#tokens + 1] = { match = true, len = best_len, dist = best_dist }
+        local ins_end = math.min(i + best_len - 1, n - MIN_MATCH + 1)
+        for k = i, ins_end do
+          local h = hash3(data, k)
+          prev[k] = head[h]
+          head[h] = k
+        end
+        i = i + best_len
+      else
+        tokens[#tokens + 1] = { match = false, byte = data:byte(i) }
+        if i + MIN_MATCH - 1 <= n then
+          local h = hash3(data, i)
+          prev[i] = head[h]
+          head[h] = i
+        end
+        i = i + 1
+      end
+    end
+
+    return tokens
+  end
+
+  local function encode_fixed_block(bw, tokens, is_final)
+    bw_write_lsb(bw, is_final and 1 or 0, 1)  -- BFINAL
+    bw_write_lsb(bw, 1, 2)                    -- BTYPE = 01 (fixed Huffman)
+
+    for _, tok in ipairs(tokens) do
+      if tok.match then
+        local lsym, lextra, lbase = table.unpack(LEN_SYM_BASE[tok.len])
+        local code, nbits = fixed_lit_code(lsym)
+        bw_write_msb(bw, code, nbits)
+        if lextra > 0 then bw_write_lsb(bw, tok.len - lbase, lextra) end
+
+        local dsym, dextra, dbase = dist_sym_extra(tok.dist)
+        local dcode, dnbits = fixed_dist_code(dsym)
+        bw_write_msb(bw, dcode, dnbits)
+        if dextra > 0 then bw_write_lsb(bw, tok.dist - dbase, dextra) end
+      else
+        local code, nbits = fixed_lit_code(tok.byte)
+        bw_write_msb(bw, code, nbits)
+      end
+    end
+
+    local code, nbits = fixed_lit_code(256)  -- end-of-block symbol
+    bw_write_msb(bw, code, nbits)
+  end
+
+  --------------------------------------------------------------------------
+  -- M.cpu_deflate_zlib(data) -> zlib-wrapped compressed bytes (string)
+  --
+  -- Self-contained: no external module required. Used as the energy-free
+  -- fallback path for M.safe_deflate.
+  --------------------------------------------------------------------------
+  function M.cpu_deflate_zlib(data)
+    local bw = new_bitwriter()
+    bw.bytes[1] = 0x78  -- CMF: deflate, 32K window
+    bw.bytes[2] = 0x9C  -- FLG: default level, FCHECK valid, FDICT=0
+
+    if #data == 0 then
+      encode_fixed_block(bw, {}, true)
+    else
+      encode_fixed_block(bw, lz77_tokenize(data), true)
+    end
+
+    local body  = bw_tostring(bw)
+    local csum  = adler32(data)
+    local trail = string.char(
+      (csum >> 24) & 0xFF, (csum >> 16) & 0xFF, (csum >> 8) & 0xFF, csum & 0xFF
+    )
+    return body .. trail
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Wrap the data component calls, falling back to CPU-based (pure-Lua)
+-- inflate/deflate when the data component reports insufficient energy.
+--
+-- The data component's energy budget can be transient (a capacitor bank
+-- recharging), so we still give it a couple of quick retries first; if it's
+-- still starved after that we switch to the CPU path for this call rather
+-- than blocking indefinitely on os.sleep(). If no CPU path is available at
+-- all (cpu_deflate module missing, for inflate), we fall back to the old
+-- unbounded retry-and-sleep behavior as a last resort.
+--------------------------------------------------------------------------------
+local ENERGY_RETRY_ATTEMPTS = 3
+
 function M.safe_inflate(bytes)
   dbg("safe_inflate: attempting to inflate %d compressed bytes via data component", #bytes)
   local attempts = 0
@@ -86,8 +391,24 @@ function M.safe_inflate(bytes)
     end
 
     if err and err:find("not enough energy", 1, true) then
-      dbg("safe_inflate: attempt %d – not enough energy, sleeping 0.5s", attempts)
-      os.sleep(0.5)
+      if M.cpu_deflate then
+        if attempts < ENERGY_RETRY_ATTEMPTS then
+          dbg("safe_inflate: attempt %d – not enough energy, sleeping 0.5s before retry", attempts)
+          os.sleep(0.5)
+        else
+          dbg("safe_inflate: attempt %d – still not enough energy, falling back to CPU inflate", attempts)
+          local ok, cpu_res = pcall(cpu_inflate_zlib_full, bytes)
+          if ok then
+            dbg("safe_inflate: CPU fallback success, inflated to %d bytes", #cpu_res)
+            return cpu_res
+          end
+          dbg("safe_inflate: CPU fallback failed (%s), resuming energy retry", tostring(cpu_res))
+          os.sleep(0.5)
+        end
+      else
+        dbg("safe_inflate: attempt %d – not enough energy, sleeping 0.5s (no CPU fallback available)", attempts)
+        os.sleep(0.5)
+      end
     else
       dbg("safe_inflate: fatal inflate error after %d attempt(s): %s", attempts, tostring(err))
       error("inflate failed: " .. tostring(err))
@@ -109,8 +430,20 @@ function M.safe_deflate(bytes)
     end
 
     if err and (err:find("not enough energy", 1, true) or err:find("too little energy", 1, true)) then
-      dbg("safe_deflate: attempt %d – not enough energy, sleeping 0.5s", attempts)
-      os.sleep(0.5)
+      if attempts < ENERGY_RETRY_ATTEMPTS then
+        dbg("safe_deflate: attempt %d – not enough energy, sleeping 0.5s before retry", attempts)
+        os.sleep(0.5)
+      else
+        dbg("safe_deflate: attempt %d – still not enough energy, falling back to pure-Lua CPU deflate", attempts)
+        local ok, cpu_res = pcall(M.cpu_deflate_zlib, bytes)
+        if ok then
+          dbg("safe_deflate: CPU fallback success, deflated to %d bytes (%.1f%%)",
+              #cpu_res, (#cpu_res / #bytes) * 100)
+          return cpu_res
+        end
+        dbg("safe_deflate: CPU fallback failed (%s), resuming energy retry", tostring(cpu_res))
+        os.sleep(0.5)
+      end
     else
       dbg("safe_deflate: fatal deflate error after %d attempt(s): %s", attempts, tostring(err))
       error("deflate failed: " .. tostring(err))
