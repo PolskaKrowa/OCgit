@@ -293,18 +293,33 @@ function M.pull(target_dir)
   -- it's the only way to recover a legacy clone without re-running clone.
   -- After this pull, .git/objects/ will be populated and subsequent pulls
   -- will use the cheap delta path.
+  -- NOTE: it's not enough to check that the *commit* object is present –
+  -- a delta fetch tells the server "I already have everything reachable
+  -- from local_sha", so if even one subtree/blob under it is missing on
+  -- disk, walk_tree() will crash later trying to read an object the
+  -- server never sent. So we actually walk the old tree here to confirm
+  -- the whole graph is intact before committing to a delta fetch.
   local local_commit_data = read_loose_object(git_dir, local_sha)
   local have_shas
+  local old_tree_intact = false
   if local_commit_data then
+    local old_tree_probe = local_commit_data:match("^tree ([0-9a-f]+)")
+    if old_tree_probe then
+      local ok_probe = pcall(walk_tree, git_dir, old_tree_probe:lower(), "", {}, function() end)
+      old_tree_intact = ok_probe
+    end
+  end
+
+  if old_tree_intact then
     print(string.format("Fetching updates %s → %s ...",
         local_sha:sub(1,7), remote_sha:sub(1,7)))
-    dbg("pull: local commit %s found on disk – using delta fetch", local_sha)
+    dbg("pull: local commit %s and full tree found on disk – using delta fetch", local_sha)
     have_shas = { local_sha }
   else
     print(string.format("Local state incomplete (objects missing from disk);"))
     print(string.format("doing a full fetch from %s ...", remote_sha:sub(1,7)))
     print(string.format("(This is a one-time cost – future pulls will be fast.)"))
-    dbg("pull: local commit %s NOT on disk – using full fetch", local_sha)
+    dbg("pull: local commit %s incomplete on disk – using full fetch", local_sha)
     have_shas = nil
   end
 
@@ -371,7 +386,7 @@ function M.pull(target_dir)
 
   local written   = 0
   local unchanged = 0
-  walk_tree(git_dir, new_tree_sha, "", objects, function(rel_path, mode, sha)
+  local ok_new_walk, new_walk_err = pcall(walk_tree, git_dir, new_tree_sha, "", objects, function(rel_path, mode, sha)
     local abs_path = target_dir .. "/" .. rel_path
 
     -- Ensure parent directory exists
@@ -416,6 +431,12 @@ function M.pull(target_dir)
     end
     old_files[rel_path] = nil
   end)
+  if not ok_new_walk then
+    error("pull: failed to walk the new tree (" .. tostring(new_walk_err) .. ").\n" ..
+          "This usually means the local repo is missing objects the server\n" ..
+          "assumed you already had. Try deleting .git/objects and re-running\n" ..
+          "pull to force a full re-fetch, or re-clone the repository.")
+  end
 
   -- 10. Delete files that vanished on the remote
   local deleted = 0
